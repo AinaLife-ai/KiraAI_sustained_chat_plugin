@@ -31,7 +31,7 @@ from core.plugin import logger
 from core.chat.message_utils import KiraMessageEvent, KiraMessageBatchEvent
 from core.chat.message_elements import Text, Image, Sticker, Record, Reply, Forward
 from core.provider import LLMRequest
-from core.utils.common_utils import get_default_vlm_prompt
+from core.utils.common_utils import get_default_vlm_prompt, speech_to_text
 
 # 标识符匹配（内容三态：空 / 描述 / (未识别) (已过期)）
 _IMAGE_RE = re.compile(r"\[Image #([^\]\s:]+): ([^\]]*)\]")
@@ -279,9 +279,15 @@ class ParallelMediaRecognizer:
             results[sid] = cached
             return
         try:
+            provider_mgr = getattr(self.ctx, "provider_mgr", None)
+            stt_client = provider_mgr.get_default_stt() if provider_mgr is not None else None
+            if stt_client is None:
+                logger.warning(f"[MediaRecognize] STT client unavailable (no default STT model) sid={sid}")
+                results[sid] = "(未识别)"
+                return
             async with self._sem_aud:
                 text = await asyncio.wait_for(
-                    self.ctx.llm_api.speech_to_text(record=info["elem"]), self.media_timeout)
+                    speech_to_text(client=stt_client, record=info["elem"]), self.media_timeout)
             if text and self._is_valid_desc(text):
                 if md5:
                     await self._cache_set(md5, text)
