@@ -1,5 +1,5 @@
 
-# KiraAI_sustained_chat_plugin/可持续聊天 2.1.0
+# KiraAI_sustained_chat_plugin/可持续聊天 2.2.0
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI_sustained_chat_plugin)
 
@@ -140,6 +140,28 @@ AI: 对了主人，我刚刚看到一个好笑的视频，想不想看？
 
 ---
 
+### 7. 新版内置：回复更快、更省 token
+
+除了"主动社交"，这个版本还内置了两项让日常对话更顺滑的能力：
+
+| 能力 | 效果 |
+|------|------|
+| **队列合并（积压处理）** | LLM 处理慢、消息爆发时，同一会话的积压批次自动合并为一次推送，**上下文只发送一次、LLM 调用次数大幅减少——更省 token**，回复更聚焦 |
+| **并行媒体识别** | 图片 VLM 与语音 STT **并行预处理**，积压批次排队期间媒体即识别完成，推送时零等待——**回复更快**，看图听音不卡顿 |
+
+```yaml
+# 消息爆发场景示例（开启队列合并后）
+用户连发: 消息1 / 消息2 / 消息3（LLM 正在处理上一条）
+→ 三条消息合并为一个批次，一次 LLM 调用统一回应
+→ 而不是三次调用、三段上下文重复发送（更省 token）
+```
+
+- ✅ 队列合并默认"不攒批"（当前批次一完成立即合并推送），软合并/超时合并阈值可配（`section_queue_merge`）
+- ✅ 并行媒体识别可配最大并行图片数/语音数、兼容并行识图插件分工（`section_media_recognition`）
+- ✅ 两个新模块均默认开启、可独立关闭，关闭后行为与旧版完全一致
+
+---
+
 ## 🎛️ 配置概览
 
 | 模块 | 功能 |
@@ -149,6 +171,8 @@ AI: 对了主人，我刚刚看到一个好笑的视频，想不想看？
 | `section_group_sustain` | 群聊持续对话（窗口、概率、模式、停止词） |
 | `section_dm_sustain` | 私聊持续对话（窗口、概率、重试、黑白名单、提示词、工具黑名单） |
 | `section_scheduled` | 定时主动任务（间隔/Cron、会话列表、工具黑名单、提示词） |
+| `section_queue_merge` | 队列合并/积压处理（积压批次合并推送，更省 token） |
+| `section_media_recognition` | 并行媒体识别（图片 VLM + 语音 STT 并行预处理，回复更快） |
 
 ---
 
@@ -202,12 +226,28 @@ croniter>=1.3.0
 
 ## 📝 版本信息
 
-- 当前版本：v2.1.0
+- 当前版本：v2.2.0
 - 兼容 KiraAI：v2.6.1+
 - 作者：KiraAI + znq19
 
 <details>
 <summary>更新日志</summary>
+
+### v2.2.0
+
+**队列合并 / 积压处理（`section_queue_merge`）—— 更省 token**
+- LLM 处理慢、消息爆发时，同一会话的积压批次自动合并为一次推送，上下文只发送一次、LLM 调用次数大幅减少
+- 三分支推送决策：软合并（小积压提前合）/ 超时合并（攒批到点必合，默认 0=不攒批）/ 独立推送（都不满足时 1:1）
+- 事件配对即时释放（ON_LLM_RESPONSE + ON_STEP_RESULT），无额外等待延迟；工具中间步不误触发
+- 阈值防护：单次合并批次数 / 消息条数（-1 自动）/ 估计 token / 媒体批次上限，超限拆批留待下轮
+- 开启调试日志（`debug_log_enabled`）可查看每个批次的放行/拦截/合并决策
+
+**并行媒体识别（`section_media_recognition`）—— 回复更快**
+- 图片 VLM 与语音 STT 并行预处理（同一 gather 混合并行，图片/语音独立限流），积压批次排队期间媒体即识别完成，推送时零等待
+- 三阶段标识符架构：stage1 拍平嵌套转发并替换媒体为标识符（阻止框架串行识别）、stage2 并行识别填充、stage3 历史兜底
+- STT 缓存复用框架 `image_desc_cache` 表（音频 md5 去重），重复语音零重复识别
+- 兼容并行识图插件（`compat_mode=auto`：装了插件图片归它、本模块只做音频；不装则全权接管）
+- VLM 描述词跟随 WebUI 配置（`bot_config.capabilities.image_recognition.desc_prompt`）
 
 ### v2.1.0
 

@@ -4,15 +4,24 @@ import io
 import os
 import random
 import re
+import sys
 import time
 import wave
 from collections import defaultdict
 from typing import Optional, List, Dict, Any
 
+# 插件管理器用 spec_from_file_location 加载 main.py，不会把插件目录加入 sys.path；
+# 显式加入以便导入同目录的 queue_merge 模块（独立插件部署必需）
+_PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
+if _PLUGIN_DIR not in sys.path:
+    sys.path.insert(0, _PLUGIN_DIR)
+
 from core.plugin import BasePlugin, logger, on, Priority
 from core.chat.message_utils import KiraMessageEvent, KiraMessageBatchEvent
 from core.provider import LLMRequest, LLMResponse
 from core.chat.message_elements import Text, Image, Reply, Sticker, Forward, Record
+from queue_merge import BatchMergeScheduler
+from media_recognize import ParallelMediaRecognizer
 
 try:
     from croniter import croniter
@@ -37,7 +46,7 @@ class DebouncePlugin(BasePlugin):
         # ========== 从 section_media 读取媒体处理配置 ==========
         media = cfg.get("section_media", {})
         self.image_recognition_only_on_mention = media.get("image_recognition_only_on_mention", True)
-        self.image_recognition_probability = float(media.get("image_recognition_probability", 0.5))
+        self.image_recognition_probability = float(media.get("image_recognition_probability", 1.0))
         self.max_images_per_message = int(media.get("max_images_per_message", 3))
         self.forward_recognition_only_on_mention = media.get("forward_recognition_only_on_mention", True)
         self.voice_recognition_only_on_mention = media.get("voice_recognition_only_on_mention", True)
@@ -118,6 +127,11 @@ class DebouncePlugin(BasePlugin):
         self._scheduler_task: Optional[asyncio.Task] = None
         self._shutdown_event = asyncio.Event()
 
+        # 队列合并 / 积压处理（BatchMergeScheduler）
+        self.merge_scheduler = BatchMergeScheduler(ctx, cfg, bot_cfg)
+        # 并行媒体识别（ParallelMediaRecognizer）
+        self.media_recognizer = ParallelMediaRecognizer(ctx, cfg, bot_cfg)
+
     async def initialize(self):
         logger.info("[Debounce] 插件已初始化")
         logger.info(f"[Debounce] 唤醒词: {self.waking_words}")
@@ -169,6 +183,9 @@ class DebouncePlugin(BasePlugin):
                 await asyncio.wait_for(self._scheduler_task, timeout=5.0)
             except (asyncio.TimeoutError, asyncio.CancelledError):
                 self._scheduler_task.cancel()
+
+        # 清理合并调度器（重发 pending + 取消 tick）
+        await self.merge_scheduler.shutdown()
         logger.info("[Debounce] 插件已终止")
 
     # ========== 工具函数 ==========
@@ -908,6 +925,36 @@ class DebouncePlugin(BasePlugin):
                 if p.name == "chat_env":
                     p.content += self.group_chat_prompt
                     break
+
+    # ================= 队列合并 / 积压处理（转发给 BatchMergeScheduler） =================
+
+    @on.im_batch_message(priority=Priority.HIGH)
+    async def on_queue_merge_batch(self, event: KiraMessageBatchEvent, *_):
+        await self.merge_scheduler.on_batch_message(event)
+
+    @on.llm_response(priority=Priority.HIGH)
+    async def on_queue_merge_resp(self, event: KiraMessageBatchEvent, resp, *_):
+        await self.merge_scheduler.on_llm_response(event, resp)
+
+    @on.step_result(priority=Priority.HIGH)
+    async def on_queue_merge_step(self, event: KiraMessageBatchEvent, *_):
+        await self.merge_scheduler.on_step_result(event)
+
+    # ================= 并行媒体识别（转发给 ParallelMediaRecognizer） =================
+    # 注意：im_message 钩子必须定义在 handle_msg 之后（同优先级按注册顺序执行），
+    #       保证"非唤醒不识别"配置先由 handle_msg 处理（兼容前提）
+
+    @on.im_message(priority=Priority.HIGH)
+    async def on_media_rec_im(self, event: KiraMessageEvent, *_):
+        await self.media_recognizer.on_im_message(event)
+
+    @on.im_batch_message(priority=Priority.HIGH)
+    async def on_media_rec_batch(self, event: KiraMessageBatchEvent, *_):
+        await self.media_recognizer.on_im_batch_message(event)
+
+    @on.llm_request(priority=Priority.HIGH)
+    async def on_media_rec_llm(self, event: KiraMessageBatchEvent, req: LLMRequest, *_):
+        await self.media_recognizer.on_llm_request(event, req)
 
     # ========== 私有辅助 ==========
     # MP3 码率表（kbps）：MPEG1 Layer III / MPEG2&2.5 Layer III
