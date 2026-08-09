@@ -1,5 +1,5 @@
 
-# KiraAI_sustained_chat_plugin/可持续聊天 2.2.0
+# KiraAI_sustained_chat_plugin/可持续聊天 2.2.1
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI_sustained_chat_plugin)
 
@@ -226,12 +226,17 @@ croniter>=1.3.0
 
 ## 📝 版本信息
 
-- 当前版本：v2.2.0
+- 当前版本：v2.2.1
 - 兼容 KiraAI：v2.6.1+
 - 作者：KiraAI + znq19
 
 <details>
 <summary>更新日志</summary>
+
+### v2.2.1
+
+**STT 兼容修复**
+- 适配新版 KiraAI：`ctx.llm_api.speech_to_text` 已废弃，改为 `provider_mgr.get_default_stt()` + `core.utils.common_utils.speech_to_text`，修复语音识别失效问题
 
 ### v2.2.0
 
