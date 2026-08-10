@@ -121,6 +121,13 @@ class BatchMergeScheduler:
                 # 自己推送的（合并/重放）批次：in-flight 就是它自己，直接放行，
                 # 防止"推送 -> 到达 -> 拦截自己 -> 超时再推 -> 再拦截"的死循环
                 return
+            if event.extra and event.extra.get("_qm_self"):
+                # 自发布批次兜底：即使 _inflight 被并发路径误清（见 _push_pending 注释），
+                # 带自发布标记的批次也绝对放行，并恢复 inflight 跟踪，防状态悬空
+                if self._inflight.get(sid) != event.event_id:
+                    self._inflight[sid] = event.event_id
+                    self._inflight_since[sid] = time.time()
+                return
             if sid in self._inflight or self._pending.get(sid):
                 # 积压媒体限制：pending 中已积压的含媒体批次达到上限时，
                 # 新到的含媒体批次直接放行独立处理（媒体及时识别，不无限积压/重复 VLM）
@@ -164,14 +171,23 @@ class BatchMergeScheduler:
             if self._inflight.get(sid) == event.event_id and sid in self._final_marked:
                 need_push = True
         if need_push:
-            await self._push_pending(sid)
+            await self._push_pending(sid, event.event_id)
 
     # ================= 推送决策（三分支，串行） =================
 
-    async def _push_pending(self, sid: str):
-        """锁内决策 + 状态更新，锁外 publish。并发调用时第二个 pop 空直接返回，安全。"""
+    async def _push_pending(self, sid: str, done_event_id: Optional[str] = None):
+        """锁内决策 + 状态更新，锁外 publish。
+
+        done_event_id：触发本次推送的完成批次 event_id（ON_STEP_RESULT 的事件）。
+        锁内先校验 _inflight[sid] 仍是该批次才执行——防止并发/重复事件（ON_STEP_RESULT
+        重复广播、hook 重复注册、tick 竞争等）在「发布合并批次 → 该批次到达
+        on_batch_message」的异步窗口内误清 _inflight，导致自己发布的批次被自己
+        拦截进 pending（会话队列死锁根因）。校验失败直接 return，不动任何状态。
+        """
         to_publish = None
         async with self._lock:
+            if done_event_id is not None and self._inflight.get(sid) != done_event_id:
+                return
             to_publish = self._decide_and_apply_locked(sid)
         if to_publish is not None:
             n_msgs = len(to_publish.messages)
@@ -293,7 +309,9 @@ class BatchMergeScheduler:
             adapter=last.adapter,
             session=last.session,
             messages=msgs,
-            extra={"merged_from": [b.batch.event_id for b in batches]},
+            # _qm_self：自发布标记，on_batch_message 凭此兜底放行自己发布的批次
+            #（详见 on_batch_message / _push_pending 注释），防异步窗口竞态自拦截
+            extra={"merged_from": [b.batch.event_id for b in batches], "_qm_self": True},
         )
         return merged
 
