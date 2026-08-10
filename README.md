@@ -1,5 +1,5 @@
 
-# KiraAI_sustained_chat_plugin/可持续聊天 2.2.1
+# KiraAI_sustained_chat_plugin/可持续聊天 2.2.2
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI_sustained_chat_plugin)
 
@@ -226,12 +226,22 @@ croniter>=1.3.0
 
 ## 📝 版本信息
 
-- 当前版本：v2.2.1
+- 当前版本：v2.2.2
 - 兼容 KiraAI：v2.6.1+
 - 作者：KiraAI + znq19
 
 <details>
 <summary>更新日志</summary>
+
+### v2.2.2
+
+**队列稳定性修复 + 媒体并发控制增强**
+- **修复热重载丢消息**：插件终止时积压批次（pending）改为按会话合并为**全新批次**重发（新 event_id、干净 stop 状态）。原实现直接重发原事件对象，而框架 `_is_stopped` 一旦置位无法复位，重进管线会被再次拦停，消息永久丢失
+- **新增「批次卡死超时」兜底（`section_queue_merge.inflight_stall_timeout`）**：当前批次自最后一次 LLM 响应起超过阈值仍无动静（LLM 挂起 / 异常崩溃导致收尾事件缺失）时，强制推送积压批次，避免会话队列死锁。默认 `0`=自动跟随默认 LLM 模型超时 + 60s 余量；LLM 慢但每轮有响应不会被误判
+- **媒体识别并发限流改为三级**（`section_media_recognition`）：批次级（`max_parallel_images` / `max_parallel_audios`，单批突发保护）+ 会话级（`vlm/stt_max_parallel_per_session`）+ 全局级（`vlm/stt_max_parallel_global`），固定获取顺序无死锁
+- **媒体「最多识别一次」**：同一消息内的每个图片/语音成功或失败后标记已处理，队列合并重发时不再重复调用 VLM/STT（防限流/429 风暴）
+- **并行识图插件兼容增强**：`compat_mode=auto` 改为运行时实时检测并行识图插件加载状态（热重载/启停即时生效）；媒体积压放行判定同时识别本插件与并行识图插件的暂存属性
+- 跨会话状态修复：媒体暂存索引按会话分层，多会话并发处理不再串扰
 
 ### v2.2.1
 

@@ -445,6 +445,13 @@
                 "default": 0,
                 "hint": "0=不限；积压中含图片/语音的批次达到该数量后，新到的含媒体批次直接放行独立处理，避免媒体积压与VLM/STT重复预处理"
             },
+            "inflight_stall_timeout": {
+                "name": "批次卡死超时(秒)",
+                "type": "float",
+                "default": -1,
+                "minimum": -1,
+                "hint": "当前批次自最后一次 LLM 响应起超过该时长仍无动静（任务崩溃/被其它插件拦截导致收尾事件缺失）时，强制推送积压批次，避免该会话队列死锁。-1=自动跟随（WebUI 里设置的 LLM 模型超时+工具执行超时）；0=不设置（关闭兜底，LLM 挂起由框架超时兜底）；正整数=手动覆盖"
+            },
             "debug_log_enabled": {
                 "name": "调试日志",
                 "type": "switch",
@@ -465,18 +472,46 @@
                 "hint": "批次媒体（图片VLM/音频STT）到达时并行识别，积压批次排队期间识别完毕；关闭则回退框架串行识别"
             },
             "max_parallel_images": {
-                "name": "最大并行图片数",
+                "name": "每批次最大并行图片数",
                 "type": "integer",
                 "default": 3,
                 "minimum": 1,
-                "hint": "同时进行的图片 VLM 识别数量上限"
+                "hint": "单个批次内同时进行的图片 VLM 识别数量上限"
             },
             "max_parallel_audios": {
-                "name": "最大并行音频数",
+                "name": "每批次最大并行音频数",
                 "type": "integer",
                 "default": 3,
                 "minimum": 1,
-                "hint": "同时进行的音频 STT 识别数量上限"
+                "hint": "单个批次内同时进行的音频 STT 识别数量上限"
+            },
+            "vlm_max_parallel_per_session": {
+                "name": "VLM 每会话最大并行数",
+                "type": "integer",
+                "default": 15,
+                "minimum": 1,
+                "hint": "单个会话同时进行的图片 VLM 识别数量上限"
+            },
+            "vlm_max_parallel_global": {
+                "name": "VLM 全局最大并行数",
+                "type": "integer",
+                "default": 40,
+                "minimum": 1,
+                "hint": "所有会话合计同时进行的图片 VLM 识别数量上限"
+            },
+            "stt_max_parallel_per_session": {
+                "name": "STT 每会话最大并行数",
+                "type": "integer",
+                "default": 15,
+                "minimum": 1,
+                "hint": "单个会话同时进行的音频 STT 识别数量上限"
+            },
+            "stt_max_parallel_global": {
+                "name": "STT 全局最大并行数",
+                "type": "integer",
+                "default": 40,
+                "minimum": 1,
+                "hint": "所有会话合计同时进行的音频 STT 识别数量上限"
             },
             "media_timeout": {
                 "name": "单媒体识别超时(秒)",

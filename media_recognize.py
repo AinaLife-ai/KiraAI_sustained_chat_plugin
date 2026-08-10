@@ -7,7 +7,9 @@
                                替换为标识符 [Image #id: ] / [Record #id: ]，阻止框架 format_to_text
                                串行识别；原始元素暂存到消息动态属性 _pir_media
     stage2 (ON_IM_BATCH_MESSAGE) 收集批次内全部暂存媒体，同一 gather 混合并行识别
-                               （图片 VLM 走 _sem_img、音频 STT 走 _sem_aud，各自限流互不阻塞），
+                               （图片 VLM / 音频 STT 各自三层限流：批次级 batch_sem →
+                               会话级 _session_img_sems/_session_aud_sems → 全局级
+                               _global_img_sem/_global_aud_sem，固定顺序无死锁），
                                填充 message_str 与 chain —— 积压批次在拦截前识别完成 = 真预处理
     stage3 (ON_LLM_REQUEST)    历史/当前残留空标识符兜底（缓存命中→填；有原媒体→现场识别；否则 (已过期)）
 - 缓存：复用框架 image_desc_cache 表（图片 md5→描述；音频 to_base64 md5→transcript），零 DB 改动
@@ -46,15 +48,27 @@ class ParallelMediaRecognizer:
         self.ctx = ctx
         sec = plugin_cfg.get("section_media_recognition", {})
         self.enabled = sec.get("enabled", True)
+        # 三层并发限制（VLM / STT 各自独立），按 批次级 → 会话级 → 全局级 依次获取：
+        #   ① 批次级（max_parallel_images / max_parallel_audios）：单个批次内同时识别的最大数，
+        #      防"一批 10 张图一次全轰出去"的突发；每个批次使用独立临时信号量
+        #   ② 会话级（vlm/stt_max_parallel_per_session）：单个会话累积的最大并行数
+        #   ③ 全局级（vlm/stt_max_parallel_global）：所有会话合计的最大并行数
         self.max_parallel_images = int(sec.get("max_parallel_images", 3))
         self.max_parallel_audios = int(sec.get("max_parallel_audios", 3))
+        self.vlm_max_parallel_per_session = int(sec.get("vlm_max_parallel_per_session", 15))
+        self.vlm_max_parallel_global = int(sec.get("vlm_max_parallel_global", 40))
+        self.stt_max_parallel_per_session = int(sec.get("stt_max_parallel_per_session", 15))
+        self.stt_max_parallel_global = int(sec.get("stt_max_parallel_global", 40))
         self.media_timeout = float(sec.get("media_timeout", 60.0))
         self.compat_mode = sec.get("compat_mode", "auto")
         self.quality_enabled = sec.get("quality_enabled", False)
         self.quality_value = int(sec.get("quality_value", 85))
 
-        self._sem_img = asyncio.Semaphore(self.max_parallel_images)
-        self._sem_aud = asyncio.Semaphore(self.max_parallel_audios)
+        self._global_img_sem = asyncio.Semaphore(max(1, self.vlm_max_parallel_global))
+        self._global_aud_sem = asyncio.Semaphore(max(1, self.stt_max_parallel_global))
+        # 每会话信号量（惰性创建，热重载后自动重建）
+        self._session_img_sems: dict[str, asyncio.Semaphore] = {}
+        self._session_aud_sems: dict[str, asyncio.Semaphore] = {}
 
         # VLM 描述语言：读全局 locale.lang；未设置默认中文（对齐并行识图插件中文 DESC_PROMPT）。
         # 实际 prompt 优先取 WebUI 配置 desc_prompt（§_describe_image），此处 lang 仅作默认兜底
@@ -67,24 +81,43 @@ class ParallelMediaRecognizer:
         except Exception:
             pass
 
-        # 检测并行识图插件是否已加载（图片归它 / 本模块只做音频）
-        self._pir_loaded = False
-        try:
-            pm = getattr(ctx, "plugin_mgr", None)
-            if pm is not None:
-                self._pir_loaded = pm.get_plugin_inst("parallel_image_reader") is not None
-        except Exception:
-            self._pir_loaded = False
-
         # 动态属性挂载名（沿用并行识图插件协议语义）
         self._media_attr = "_pir_media"
-        # 当前回合暂存原媒体的 id 索引（stage3 现场识别用）
-        self._round_media: dict[str, dict] = {}
+        # 当前回合暂存原媒体的 id 索引（stage3 现场识别用）。
+        # 按 sid 分层：多会话并发处理时互不串扰
+        self._round_media: dict[str, dict[str, dict]] = {}
 
     # ================= 调试日志 =================
 
     def _log(self, msg: str):
         logger.debug(f"[MediaRecognize] {msg}")
+
+    def _pir_active(self) -> bool:
+        """运行时实时检测并行识图插件（PIR）是否已加载。
+
+        compat_mode=auto 时图片归 PIR（本模块只做音频）。不能像旧实现那样在
+        __init__ 里做一次性快照：插件可热重载/启停，快照会过时——PIR 中途卸载后
+        图片无人处理、中途加载后双重处理。
+        """
+        if self.compat_mode != "auto":
+            return False
+        try:
+            pm = getattr(self.ctx, "plugin_mgr", None)
+            if pm is not None:
+                return pm.get_plugin_inst("parallel_image_reader") is not None
+        except Exception:
+            pass
+        return False
+
+    # ================= 三级并发限流（批次级 + 每会话 + 全局） =================
+
+    def _session_sem(self, sems: dict, sid: str, limit: int) -> asyncio.Semaphore:
+        """惰性获取/创建某会话的信号量。"""
+        sem = sems.get(sid)
+        if sem is None:
+            sem = asyncio.Semaphore(max(1, limit))
+            sems[sid] = sem
+        return sem
 
     # ================= stage1：拍平嵌套 Forward + 替换为标识符 =================
 
@@ -148,7 +181,10 @@ class ParallelMediaRecognizer:
             media: dict[str, dict] = {}
             await self._walk_chain(event.message.chain, media, set())
             if media:
-                setattr(event.message, self._media_attr, media)
+                # 合并而非覆盖：并行识图插件（PIR）可能已先写入 Image 索引，
+                # 直接覆盖会让它 stage2/stage3 拿不到图片（图片标识符永远空）
+                existing = getattr(event.message, self._media_attr, None) or {}
+                setattr(event.message, self._media_attr, {**existing, **media})
         except Exception:
             logger.exception("[MediaRecognize] stage1 error")
 
@@ -164,8 +200,9 @@ class ParallelMediaRecognizer:
             if isinstance(elem, Text):
                 continue
             if isinstance(elem, (Image, Sticker)):
-                # 并行识图插件已加载且 auto 模式：图片归它，本模块不碰
-                if self._pir_loaded and self.compat_mode == "auto":
+                # 并行识图插件已加载且 auto 模式：图片归它，本模块不碰。
+                # 运行时实时检测（不是 __init__ 快照），PIR 热重载/启停后自动生效
+                if self._pir_active():
                     continue
                 replaced = await self._replace_media(elem, "Image", media)
                 if replaced is not None:
@@ -181,7 +218,12 @@ class ParallelMediaRecognizer:
                     await self._walk_chain(sub, media, visited)
 
     async def _replace_media(self, elem, mtype: str, media: dict) -> Optional[Text]:
-        """媒体 → 标识符 Text；缓存命中填内容、miss 空标识符 + 暂存原元素。"""
+        """媒体 → 标识符 Text；缓存命中填内容、miss 空标识符 + 暂存原元素。
+
+        _done 标记语义：标识符已含最终内容（缓存描述）或已识别过（含失败），
+        stage2 重发（队列合并重放）时跳过——每条消息的每个媒体最多识别一次，
+        避免同一条消息被反复 VLM/STT（限流/429 风暴源头）。
+        """
         try:
             if mtype == "Record":
                 md5 = await self._record_md5(elem)
@@ -197,7 +239,7 @@ class ParallelMediaRecognizer:
         else:
             short_id = f"noid_{id(elem)}"
             desc = ""
-        media[short_id] = {"md5": md5, "elem": elem, "type": mtype}
+        media[short_id] = {"md5": md5, "elem": elem, "type": mtype, "_done": bool(desc)}
         return Text(f"[{mtype} #{short_id}: {desc}]")
 
     async def _record_md5(self, elem) -> Optional[str]:
@@ -225,21 +267,38 @@ class ParallelMediaRecognizer:
             if not tasks:
                 return
 
-            # 当前回合原媒体索引（stage3 用）
-            self._round_media = {}
+            # 当前回合原媒体索引（stage3 用）；按 sid 分层防多会话并发串扰，
+            # 同一 sid 的并发批次用 setdefault+update 合并，避免后到批次清掉先到批次
+            sess_sid = event.session.sid
+            self._round_media.setdefault(sess_sid, {})
             for _, media in tasks:
-                for sid, info in media.items():
-                    self._round_media[sid] = info
+                for short_id, info in media.items():
+                    self._round_media[sess_sid][short_id] = info
+            # 防无界增长：最多保留 128 个 sid 的索引，超出清最旧
+            if len(self._round_media) > 128:
+                for old_sid in list(self._round_media)[: len(self._round_media) - 64]:
+                    self._round_media.pop(old_sid, None)
 
-            # 混合并行：图片 VLM 与 音频 STT 同一 gather，各自限流互不阻塞
+            # 只识别未处理（_done=False）的媒体：缓存命中（stage1 已填描述）或
+            # 已识别过（成功/失败）的跳过——队列合并重发同一批消息时不会重复 VLM/STT
+            pending_tasks = [
+                (message, {k: v for k, v in media.items() if not v.get("_done")})
+                for message, media in tasks
+            ]
+            pending_tasks = [(m, md) for m, md in pending_tasks if md]
+
+            # 混合并行：图片 VLM 与 音频 STT 同一 gather，各自限流互不阻塞。
+            # 批次级信号量：每批次临时创建，限制本批次内同时识别的数量（突发保护）
+            batch_img_sem = asyncio.Semaphore(max(1, self.max_parallel_images))
+            batch_aud_sem = asyncio.Semaphore(max(1, self.max_parallel_audios))
             results: dict[str, str] = {}
             coros = []
-            for _, media in tasks:
-                for sid, info in media.items():
+            for _, media in pending_tasks:
+                for short_id, info in media.items():
                     if info["type"] == "Image":
-                        coros.append(self._describe_one(sid, info, results))
+                        coros.append(self._describe_one(sess_sid, short_id, info, results, batch_sem=batch_img_sem))
                     else:
-                        coros.append(self._transcribe_one(sid, info, results))
+                        coros.append(self._transcribe_one(sess_sid, short_id, info, results, batch_sem=batch_aud_sem))
             await asyncio.gather(*coros, return_exceptions=True)
 
             # 填充 message_str 与 chain
@@ -252,52 +311,76 @@ class ParallelMediaRecognizer:
         except Exception:
             logger.exception("[MediaRecognize] stage2 error")
 
-    async def _describe_one(self, sid: str, info: dict, results: dict):
+    async def _describe_one(self, sess_sid: str, media_id: str, info: dict, results: dict,
+                            batch_sem: Optional[asyncio.Semaphore] = None):
         md5 = info["md5"]
         cached = await self._cache_get(md5) if md5 else None
         if cached:
-            results[sid] = cached
+            info["_done"] = True
+            results[media_id] = cached
             return
         try:
-            async with self._sem_img:
-                desc = await asyncio.wait_for(self._describe_image(info["elem"]), self.media_timeout)
+            sess_sem = self._session_sem(self._session_img_sems, sess_sid, self.vlm_max_parallel_per_session)
+            # 三层限流：批次级 → 会话级 → 全局级（固定获取顺序，无死锁）
+            if batch_sem is not None:
+                async with batch_sem, sess_sem, self._global_img_sem:
+                    desc = await asyncio.wait_for(self._describe_image(info["elem"]), self.media_timeout)
+            else:
+                async with sess_sem, self._global_img_sem:
+                    desc = await asyncio.wait_for(self._describe_image(info["elem"]), self.media_timeout)
+            # 无论成功失败都标记已处理：同一条消息重发不再重复识别（防 429 风暴）
+            info["_done"] = True
             if desc and self._is_valid_desc(desc):
                 if md5:
                     await self._cache_set(md5, desc)
-                results[sid] = desc
+                results[media_id] = desc
             else:
-                logger.warning(f"[MediaRecognize] image VLM returned empty/invalid desc sid={sid} md5={md5[:8] if md5 else 'n/a'}")
-                results[sid] = "(未识别)"
-        except (asyncio.TimeoutError, Exception) as e:
-            logger.warning(f"[MediaRecognize] image describe failed sid={sid}: {type(e).__name__}: {e}")
-            results[sid] = "(未识别)"
+                logger.warning(f"[MediaRecognize] image VLM returned empty/invalid desc id={media_id} md5={md5[:8] if md5 else 'n/a'}")
+                results[media_id] = "(未识别)"
+        except Exception as e:
+            info["_done"] = True
+            logger.warning(f"[MediaRecognize] image describe failed id={media_id}: {type(e).__name__}: {e}")
+            results[media_id] = "(未识别)"
 
-    async def _transcribe_one(self, sid: str, info: dict, results: dict):
+    async def _transcribe_one(self, sess_sid: str, media_id: str, info: dict, results: dict,
+                              batch_sem: Optional[asyncio.Semaphore] = None):
         md5 = info["md5"]
         cached = await self._cache_get(md5) if md5 else None
         if cached:
-            results[sid] = cached
+            info["_done"] = True
+            results[media_id] = cached
             return
         try:
             provider_mgr = getattr(self.ctx, "provider_mgr", None)
             stt_client = provider_mgr.get_default_stt() if provider_mgr is not None else None
             if stt_client is None:
-                logger.warning(f"[MediaRecognize] STT client unavailable (no default STT model) sid={sid}")
-                results[sid] = "(未识别)"
+                info["_done"] = True
+                logger.warning(f"[MediaRecognize] STT client unavailable (no default STT model) id={media_id}")
+                results[media_id] = "(未识别)"
                 return
-            async with self._sem_aud:
-                text = await asyncio.wait_for(
-                    speech_to_text(client=stt_client, record=info["elem"]), self.media_timeout)
+            sess_sem = self._session_sem(self._session_aud_sems, sess_sid, self.stt_max_parallel_per_session)
+            # 三层限流：批次级 → 会话级 → 全局级（固定获取顺序，无死锁）
+            if batch_sem is not None:
+                async with batch_sem, sess_sem, self._global_aud_sem:
+                    text = await asyncio.wait_for(
+                        speech_to_text(client=stt_client, record=info["elem"]), self.media_timeout)
+            else:
+                async with sess_sem, self._global_aud_sem:
+                    text = await asyncio.wait_for(
+                        speech_to_text(client=stt_client, record=info["elem"]), self.media_timeout)
+            # 无论成功失败都标记已处理：同一条消息重发不再重复识别（防 429 风暴）
+            info["_done"] = True
             if text and self._is_valid_desc(text):
                 if md5:
                     await self._cache_set(md5, text)
-                results[sid] = text
+                results[media_id] = text
             else:
-                logger.warning(f"[MediaRecognize] STT returned empty/invalid text sid={sid}")
-                results[sid] = "(未识别)"
-        except (asyncio.TimeoutError, Exception) as e:
-            logger.warning(f"[MediaRecognize] STT failed sid={sid}: {type(e).__name__}: {e}")
-            results[sid] = "(未识别)"
+                logger.warning(f"[MediaRecognize] STT returned empty/invalid text id={media_id}")
+                results[media_id] = "(未识别)"
+        except Exception as e:
+            info["_done"] = True
+            logger.warning(f"[MediaRecognize] STT failed id={media_id}: {type(e).__name__}: {e}")
+            results[media_id] = "(未识别)"
 
     async def _describe_image(self, elem) -> str:
         """图片 VLM：统一 to_data_url → vlm.chat 路径（对齐并行识图插件已验证路径）；
@@ -395,16 +478,25 @@ class ParallelMediaRecognizer:
             if not need:
                 return
             results: dict[str, str] = {}
+            # 批次级限流同样作用于 stage3 兜底识别（一个 LLM 请求内的残留标识符 = 一个批次）
+            batch_img_sem = asyncio.Semaphore(max(1, self.max_parallel_images))
+            batch_aud_sem = asyncio.Semaphore(max(1, self.max_parallel_audios))
             coros = []
-            for sid in need:
-                info = self._round_media.get(sid)
-                if info:
+            # 只查本会话当前回合暂存的媒体（按 sid 分层，多会话不串扰）
+            round_media = self._round_media.get(event.sid, {})
+            for media_id in need:
+                info = round_media.get(media_id)
+                if info and not info.get("_done"):
+                    # 有原媒体且未识别过 → 现场识别
                     if info["type"] == "Image":
-                        coros.append(self._describe_one(sid, info, results))
+                        coros.append(self._describe_one(event.sid, media_id, info, results, batch_sem=batch_img_sem))
                     else:
-                        coros.append(self._transcribe_one(sid, info, results))
+                        coros.append(self._transcribe_one(event.sid, media_id, info, results, batch_sem=batch_aud_sem))
+                elif info:
+                    # 已识别过但占位符仍空（异常路径）：直接标未识别，不重复撞模型
+                    results[media_id] = "(未识别)"
                 else:
-                    results[sid] = "(已过期)"
+                    results[media_id] = "(已过期)"
             if coros:
                 await asyncio.gather(*coros, return_exceptions=True)
             for p in getattr(req, "user_prompt", []) or []:
