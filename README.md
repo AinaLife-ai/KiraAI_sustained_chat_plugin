@@ -1,5 +1,4 @@
-
-# KiraAI_sustained_chat_plugin/可持续聊天 2.2.2
+# KiraAI_sustained_chat_plugin/可持续聊天 2.2.3
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI_sustained_chat_plugin)
 
@@ -142,7 +141,7 @@ AI: 对了主人，我刚刚看到一个好笑的视频，想不想看？
 
 ### 7. 新版内置：回复更快、更省 token
 
-除了"主动社交"，这个版本还内置了两项让日常对话更顺滑的能力：
+除了“主动社交”，这个版本还内置了两项让日常对话更顺滑的能力：
 
 | 能力 | 效果 |
 |------|------|
@@ -220,18 +219,28 @@ croniter>=1.3.0
 
 三者叠加，AI 就从一个被动的工具，变成了一个**主动的数字伙伴**。
 
-**最重要的是**：所有主动行为都受到**多维度频率控制**，确保 AI 有存在感但不讨人厌，主动但不骚扰——这才是“活”的 AI 应有的样子。
+**最重要的是**：所有主动行为都受到**多维度频率控制**，确保 AI 有存在感但不烦人，主动但不骚扰——这才是“活”的 AI 应有的样子。
 
 ---
 
 ## 📝 版本信息
 
-- 当前版本：v2.2.2
+- 当前版本：v2.2.3
 - 兼容 KiraAI：v2.6.1+
 - 作者：KiraAI + znq19
 
 <details>
 <summary>更新日志</summary>
+
+### v2.2.3
+
+**队列合并自拦截死锁修复（与 ContextCondensation 等阻塞型插件共存时稳定复现）**
+
+- **根因**：`BatchMergeScheduler._push_pending()` 调用的 `_decide_and_apply_locked()` 会**无条件清空 `_inflight[sid]`**（即使 pending 为空）；而 KiraAI `EventBus.publish()` 只是**异步入队**（`asyncio.Queue.put`，见 `core/event_bus.py`），发布后的合并批次要等事件循环调度才到达 `on_batch_message`。在这个异步窗口内，若同一会话再次触发 `_push_pending`（ON_STEP_RESULT 重复广播、插件 hook 重复注册、tick 竞争等——`core/message_manager.py::send_llm_text()` 在 Agent 每一步都会触发 ON_STEP_RESULT），会把刚发布的合并批次的 inflight 标记清掉，导致该批次到达 `on_batch_message` 时匹配不上 `_inflight`，被误判为外部批次 `event.stop()` 拦截进 pending，会话队列永久死锁
+- **日志特征**：`进入最后一步（文本收尾）` 打印两次（同 event_id）；`发布批次 xxx` 后紧跟 `拦截批次 xxx 进 pending（pending=1）`；之后新消息全部 `拦截进 pending` 且数量只增不减
+- **修复**：
+  1. `_push_pending(sid, done_event_id)` 增加完成批次校验：锁内先确认 `_inflight[sid]` 仍是本次完成的 event_id 才执行推送决策，重复/并发事件直接跳过，不再误清 in-flight 状态
+  2. `_build_merged_batch` 为合并批次打 `_qm_self` 自发布标记，`on_batch_message` 识别后无条件放行并恢复 inflight 跟踪——双保险，对一切竞态路径（含 tick、shutdown 重发）免疫自拦截
 
 ### v2.2.2
 
