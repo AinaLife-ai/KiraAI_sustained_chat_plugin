@@ -1,4 +1,4 @@
-"""队列合并 / 积压处理调度器（v2.3）
+"""队列合并 / 积压处理调度器（v2.4）
 
 设计要点（对齐方案文档 v2.3）：
 - 只在"当前批次（in-flight）处理中"时拦截后续批次进 pending；
@@ -8,7 +8,10 @@
                    =0 时恒成立（不攒批，当前批次完成即全量合并，拆批由各上限控制）
     分支③ 独立推送：都不满足 -> 只推第一个批次（1:1），其余留 pending 等下一轮
 - 用"事件配对"判定 in-flight 完成（0 延迟，无 release_delay）：
-    ON_LLM_RESPONSE 无 tool_calls = 最后一步（文本收尾）-> 标记 _final_marked
+    ON_LLM_RESPONSE 无 tool_calls = 最后一步（文本收尾）-> 标记 _final_marked；
+    最后一步仍带 tool_calls（agent_step_index >= max_tool_loop）也标记 —— 该步工具
+    执行完 agent 即结束（无最终文本收尾），提前标记让 tick/ON_STEP_RESULT 立即推送
+    pending，避免等「in-flight 卡死兜底」（LLM 超时 + 工具超时，默认 180s）的长哑巴
     ON_STEP_RESULT（消息发送后触发）同 event_id 且已标记 -> 执行推送决策
 - 自拦截防护：自己推送的（合并/重放）批次在 on_batch_message 直接放行，防死循环
 - 积压媒体限制（media_preprocess_enabled + media_preprocess_max_batches）：
@@ -83,6 +86,14 @@ class BatchMergeScheduler:
         else:
             self.inflight_stall_timeout = llm_timeout + tool_timeout  # -1 自动
 
+        # 最大 agent 步数（与框架 message_manager 同源 bot_config.agent.max_tool_loop）：
+        # 用于识别"最后一步仍带工具"的 LLM 响应（该步工具执行完 agent 即结束，
+        # 无最终文本收尾，需要提前标记 final 让队列立即推送）。无效值回退 2（框架默认）。
+        try:
+            self.max_steps = int(ctx.config.get_config("bot_config.agent.max_tool_loop"))
+        except (TypeError, ValueError):
+            self.max_steps = 2
+
         # -1 自动解析
         buffer_cap = int(bot_cfg.get("max_buffer_messages", 5))
         recv_unmentioned = plugin_cfg.get("receive_unmentioned", False)
@@ -150,7 +161,9 @@ class BatchMergeScheduler:
 
     async def on_llm_response(self, event: KiraMessageBatchEvent, resp: LLMResponse, *_):
         """ON_LLM_RESPONSE：任何响应都刷新 in-flight 活动计时（LLM 慢但活着 = 不判卡死）；
-        无 tool_calls = 该批次最后一步（文本收尾）-> 标记。"""
+        无 tool_calls = 该批次最后一步（文本收尾）-> 标记；
+        最后一步仍带 tool_calls（agent_step_index >= max_tool_loop）-> 工具执行完 agent
+        即结束（无最终文本收尾），同样标记，避免等卡死兜底（默认 180s）才推送 pending。"""
         if not self.enabled:
             return
         async with self._lock:
@@ -160,6 +173,9 @@ class BatchMergeScheduler:
                 if not resp.tool_calls:
                     self._final_marked.add(sid)
                     self._log(sid, f"批次 {event.event_id} 进入最后一步（文本收尾）")
+                elif self._is_last_step(resp):
+                    self._final_marked.add(sid)
+                    self._log(sid, f"批次 {event.event_id} 最后一步仍带工具，提前标记收尾")
 
     async def on_step_result(self, event: KiraMessageBatchEvent, *_):
         """ON_STEP_RESULT：最后一步消息已发送完（事实 #9）-> 执行推送决策（0 延迟）。"""
@@ -172,6 +188,20 @@ class BatchMergeScheduler:
                 need_push = True
         if need_push:
             await self._push_pending(sid, event.event_id)
+
+    def _is_last_step(self, resp: LLMResponse) -> bool:
+        """agent_step_index 是否已达最大步数（框架最后一步）。
+
+        框架 agent_executor 每步写入 llm_resp.agent_step_index = step_index（1 起），
+        最后一步 == max_tool_loop；该步即使仍带 tool_calls，工具执行完 agent 也会结束
+        （无最终文本收尾），故需提前标记。旧框架/其它调用方缺该字段时返回 False，
+        自动退回原行为（等卡死兜底），不出错。
+        """
+        idx = getattr(resp, "agent_step_index", None)
+        try:
+            return idx is not None and int(idx) >= self.max_steps
+        except (TypeError, ValueError):
+            return False
 
     # ================= 推送决策（三分支，串行） =================
 
