@@ -1,4 +1,4 @@
-# KiraAI_sustained_chat_plugin/可持续聊天 2.2.3
+# KiraAI_sustained_chat_plugin/可持续聊天 2.2.4
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI_sustained_chat_plugin)
 
@@ -225,12 +225,20 @@ croniter>=1.3.0
 
 ## 📝 版本信息
 
-- 当前版本：v2.2.3
+- 当前版本：v2.2.4
 - 兼容 KiraAI：v2.6.1+
 - 作者：KiraAI + znq19
 
 <details>
 <summary>更新日志</summary>
+
+### v2.2.4
+
+**最后一步带工具即时收尾 + provider 全挂不误开窗**
+
+- **队列合并不再哑 3 分钟**：agent 在最大步数（`max_tool_loop`）仍返回工具调用时，该步工具执行完即结束、无最终文本收尾。此前 `_final_marked` 只认“无 tool_calls 的文本收尾”，此类批次只能等「批次卡死超时」兜底（默认 LLM 超时 + 工具超时 ≈ 180s）才推送 pending，期间新消息全部被拦截（bot 哑 3 分钟，不丢消息）。现在 `on_llm_response` 通过 `resp.agent_step_index >= max_tool_loop` 识别“最后一步仍带工具”，同样标记收尾，由 tick / ON_STEP_RESULT 立即推送
+- **provider 全挂时不再误开持续窗口**：框架在所有模型失败时返回 `[ProviderError] ...` 错误文本（无 tool_calls、直接收尾）。此前持续对话判定会把它当成正常 AI 回复而重新开窗，在 provider 恢复前反复主动触发。现在识别该前缀后静默结束，不开窗
+- 兼容性：旧框架响应缺 `agent_step_index` 字段时自动退回原行为（等卡死兜底），不出错
 
 ### v2.2.3
 
