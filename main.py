@@ -832,6 +832,13 @@ class DebouncePlugin(BasePlugin):
 
         ai_text = (resp.text_response or "").strip()
 
+        # provider 全挂时框架返回 "[ProviderError] ..." 错误文本（无 tool_calls，
+        # agent_executor 标记 is_final=True 直接收尾）。它不是真实 AI 回复：若按正常
+        # 回复处理会误开持续窗口，在 provider 恢复前反复主动触发。识别后静默结束。
+        if ai_text.startswith("[ProviderError]"):
+            logger.debug(f"[Sustain] provider 全挂错误响应，不开窗: {sid}")
+            return
+
         # === 私聊持续对话 ===
         if not event.is_group_message() and self.dm_sustain_enabled:
             if self._is_dm_allowed(sid):
