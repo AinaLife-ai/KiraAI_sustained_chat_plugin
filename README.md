@@ -225,12 +225,20 @@ croniter>=1.3.0
 
 ## 📝 版本信息
 
-- 当前版本：v2.2.4
-- 兼容 KiraAI：v2.6.1+
+- 当前版本：v2.2.5
+- 兼容 KiraAI：v2.6.1+（原生多模态兼容需 2.31.0+）（原生多模态兼容需 2.31.0+）
 - 作者：KiraAI + znq19
 
 <details>
 <summary>更新日志</summary>
+
+### v2.2.5
+
+**兼容 KiraAI v2.31.0 原生多模态（native 模式）**
+
+- 运行时检测 `bot_config.capabilities.image_recognition.mode == "native"`：图片保留在消息链中，由框架原生多模态直传模型（官方图片压缩 + kira_image_ref 持久化引用），本插件只做音频 STT，不再走 VLM 描述
+- stage1 / stage2 / stage3 三阶段均跳过图片处理；非唤醒消息图片仍按「非唤醒不识别」策略替换为占位（省 token 设计不变）
+- 默认 `vlm_description` 模式行为完全不变
 
 ### v2.2.4
 

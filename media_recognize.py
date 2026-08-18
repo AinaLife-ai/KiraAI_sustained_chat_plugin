@@ -1,4 +1,4 @@
-"""并行媒体识别模块（v2.3）—— 图片 VLM + 音频 STT 并行预处理
+"""并行媒体识别模块（v2.3.1）—— 图片 VLM + 音频 STT 并行预处理
 
 设计要点（对齐方案文档 KiraAI并行媒体识别模块对齐方案.md v1.0）：
 - 三阶段标识符架构（照搬并行识图插件的成熟模式，扩展音频）：
@@ -17,6 +17,9 @@
   （对齐框架 message_format_to_text 行为；未配置时用 locale.lang 语言默认 prompt）
 - 兼容：compat_mode=auto 检测 parallel_image_reader 插件——装了则图片归它（优先级 99 先处理）、
         本模块只做音频（它不碰 Record）；不装则全权接管图片+音频
+- 原生多模态：native 模式运行时实时检测（_native_mode()，非 __init__ 快照）——
+  用户在 WebUI 切换 bot_config.capabilities.image_recognition.mode 立即生效，
+  无需重启 Kira / 重载插件（配置走内存缓存，微秒级，零延迟）
 - 与 z/sustained"非唤醒不识别"兼容：im_message 钩子须定义在 handle_msg 之后（handle_msg 先替换
   非唤醒媒体为 [图片]/[语音] 占位，本模块后执行链上已无媒体 → 不识别非唤醒消息）
 """
@@ -81,6 +84,18 @@ class ParallelMediaRecognizer:
         except Exception:
             pass
 
+        # 原生多模态模式（KiraAI v2.31.0+）：bot_config.capabilities.image_recognition.mode == "native"
+        # 时，图片由框架原生多模态直接传给模型（官方压缩 + kira_image_ref 持久化引用），
+        # 本模块只做音频 STT，stage1 不再替换 Image/Sticker —— 否则 _build_native_content
+        # 遍历 chain 找不到图片元素，原生多模态内容为空（模型收不到图），且 stage2 仍会
+        # 调用 VLM 描述，与 native 模式"省 VLM token 直传图片"的初衷冲突。
+        # 注意：非唤醒消息的图片仍由宿主 handle_msg 按"非唤醒不识别"策略替换为 [图片] 占位，
+        # 只有唤醒消息的图片会保留并走原生多模态 —— 与 z/s 版省 token 设计一致。
+        # 模式检测不做 __init__ 快照，改由 _native_mode() 每次事件实时读取（见下）：
+        # 用户在 WebUI 直接切换 mode 而不重启/重载时，快照会过时——切到 native 后 stage1 仍
+        # 替换图片（原生多模态收不到图）、切回 vlm_description 后图片无人识别（VLM 被跳过）。
+        # 实时读配置走内存缓存（微秒级），无卡顿无延迟，WebUI 保存后立即生效。
+
         # 动态属性挂载名（沿用并行识图插件协议语义）
         self._media_attr = "_pir_media"
         # 当前回合暂存原媒体的 id 索引（stage3 现场识别用）。
@@ -105,6 +120,24 @@ class ParallelMediaRecognizer:
             pm = getattr(self.ctx, "plugin_mgr", None)
             if pm is not None:
                 return pm.get_plugin_inst("parallel_image_reader") is not None
+        except Exception:
+            pass
+        return False
+
+    def _native_mode(self) -> bool:
+        """运行时实时检测原生多模态模式（KiraAI v2.31.0+）。
+
+        与 _pir_active 同理，不做 __init__ 一次性快照：用户可能在 WebUI 直接切换
+        bot_config.capabilities.image_recognition.mode 而不重启 Kira / 重载插件，
+        快照会过时。每次事件实时读取配置（框架配置走内存缓存，微秒级，
+        无卡顿延迟），WebUI 保存后立即生效。
+        """
+        try:
+            if hasattr(self.ctx, "config") and self.ctx.config is not None:
+                mode = self.ctx.config.get_config(
+                    "bot_config.capabilities.image_recognition.mode", "vlm_description"
+                )
+                return str(mode or "").lower() == "native"
         except Exception:
             pass
         return False
@@ -204,6 +237,11 @@ class ParallelMediaRecognizer:
                 # 运行时实时检测（不是 __init__ 快照），PIR 热重载/启停后自动生效
                 if self._pir_active():
                     continue
+                # 原生多模态模式（KiraAI v2.31.0+）：图片保留在 chain 中，
+                # 由框架 _build_native_content 收集并直传模型（官方压缩 + 持久化引用）。
+                # 本模块不替换、不识别图片，只做音频 STT。
+                if self._native_mode():
+                    continue
                 replaced = await self._replace_media(elem, "Image", media)
                 if replaced is not None:
                     chain[idx] = replaced
@@ -286,6 +324,13 @@ class ParallelMediaRecognizer:
                 for message, media in tasks
             ]
             pending_tasks = [(m, md) for m, md in pending_tasks if md]
+            # 原生多模态模式：图片已由框架直传模型，stage2 只做音频 STT
+            if self._native_mode():
+                pending_tasks = [
+                    (m, {k: v for k, v in md.items() if v.get("type") != "Image"})
+                    for m, md in pending_tasks
+                ]
+                pending_tasks = [(m, md) for m, md in pending_tasks if md]
 
             # 混合并行：图片 VLM 与 音频 STT 同一 gather，各自限流互不阻塞。
             # 批次级信号量：每批次临时创建，限制本批次内同时识别的数量（突发保护）
@@ -489,6 +534,10 @@ class ParallelMediaRecognizer:
                 if info and not info.get("_done"):
                     # 有原媒体且未识别过 → 现场识别
                     if info["type"] == "Image":
+                        # 原生多模态模式：图片不识别，直接标 (未识别) 占位
+                        if self._native_mode():
+                            results[media_id] = "(未识别)"
+                            continue
                         coros.append(self._describe_one(event.sid, media_id, info, results, batch_sem=batch_img_sem))
                     else:
                         coros.append(self._transcribe_one(event.sid, media_id, info, results, batch_sem=batch_aud_sem))
