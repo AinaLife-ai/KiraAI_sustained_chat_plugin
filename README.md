@@ -1,4 +1,4 @@
-# KiraAI_sustained_chat_plugin/可持续聊天 2.2.4
+# KiraAI_sustained_chat_plugin/可持续聊天 2.2.5
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI_sustained_chat_plugin)
 
@@ -226,7 +226,7 @@ croniter>=1.3.0
 ## 📝 版本信息
 
 - 当前版本：v2.2.5
-- 兼容 KiraAI：v2.6.1+（原生多模态兼容需 2.31.0+）（原生多模态兼容需 2.31.0+）
+- 兼容 KiraAI：v2.29.7+
 - 作者：KiraAI + znq19
 
 <details>
