@@ -81,6 +81,23 @@ class ParallelMediaRecognizer:
         except Exception:
             pass
 
+        # 原生多模态模式（KiraAI v2.31.0+）：bot_config.capabilities.image_recognition.mode == "native"
+        # 时，图片由框架原生多模态直接传给模型（官方压缩 + kira_image_ref 持久化引用），
+        # 本模块只做音频 STT，stage1 不再替换 Image/Sticker —— 否则 _build_native_content
+        # 遍历 chain 找不到图片元素，原生多模态内容为空（模型收不到图），且 stage2 仍会
+        # 调用 VLM 描述，与 native 模式"省 VLM token 直传图片"的初衷冲突。
+        # 注意：非唤醒消息的图片仍由宿主 handle_msg 按"非唤醒不识别"策略替换为 [图片] 占位，
+        # 只有唤醒消息的图片会保留并走原生多模态 —— 与 z/s 版省 token 设计一致。
+        self._native_image_mode = False
+        try:
+            if hasattr(ctx, "config") and ctx.config is not None:
+                mode = ctx.config.get_config(
+                    "bot_config.capabilities.image_recognition.mode", "vlm_description"
+                )
+                self._native_image_mode = str(mode or "").lower() == "native"
+        except Exception:
+            pass
+
         # 动态属性挂载名（沿用并行识图插件协议语义）
         self._media_attr = "_pir_media"
         # 当前回合暂存原媒体的 id 索引（stage3 现场识别用）。
@@ -204,6 +221,11 @@ class ParallelMediaRecognizer:
                 # 运行时实时检测（不是 __init__ 快照），PIR 热重载/启停后自动生效
                 if self._pir_active():
                     continue
+                # 原生多模态模式（KiraAI v2.31.0+）：图片保留在 chain 中，
+                # 由框架 _build_native_content 收集并直传模型（官方压缩 + 持久化引用）。
+                # 本模块不替换、不识别图片，只做音频 STT。
+                if self._native_image_mode:
+                    continue
                 replaced = await self._replace_media(elem, "Image", media)
                 if replaced is not None:
                     chain[idx] = replaced
@@ -286,6 +308,13 @@ class ParallelMediaRecognizer:
                 for message, media in tasks
             ]
             pending_tasks = [(m, md) for m, md in pending_tasks if md]
+            # 原生多模态模式：图片已由框架直传模型，stage2 只做音频 STT
+            if self._native_image_mode:
+                pending_tasks = [
+                    (m, {k: v for k, v in md.items() if v.get("type") != "Image"})
+                    for m, md in pending_tasks
+                ]
+                pending_tasks = [(m, md) for m, md in pending_tasks if md]
 
             # 混合并行：图片 VLM 与 音频 STT 同一 gather，各自限流互不阻塞。
             # 批次级信号量：每批次临时创建，限制本批次内同时识别的数量（突发保护）
@@ -489,6 +518,10 @@ class ParallelMediaRecognizer:
                 if info and not info.get("_done"):
                     # 有原媒体且未识别过 → 现场识别
                     if info["type"] == "Image":
+                        # 原生多模态模式：图片不识别，直接标 (未识别) 占位
+                        if self._native_image_mode:
+                            results[media_id] = "(未识别)"
+                            continue
                         coros.append(self._describe_one(event.sid, media_id, info, results, batch_sem=batch_img_sem))
                     else:
                         coros.append(self._transcribe_one(event.sid, media_id, info, results, batch_sem=batch_aud_sem))
