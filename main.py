@@ -63,6 +63,10 @@ class DebouncePlugin(BasePlugin):
         self.stop_on_ai_keywords = group_sustain.get("stop_on_ai_keywords", [])
         self.stop_on_ai_empty = group_sustain.get("stop_on_ai_empty", True)
         self.sustain_mode = group_sustain.get("sustain_mode", "per_message")
+        # 新增：群聊持续对话作用域（白名单/黑名单）与 LLM 请求时开窗判定
+        self.sustain_allowed_sessions = group_sustain.get("sustain_allowed_sessions", [])
+        self.sustain_denied_sessions = group_sustain.get("sustain_denied_sessions", [])
+        self.sustain_judge_on_llm_request = group_sustain.get("sustain_judge_on_llm_request", True)
 
         # ========== 从 section_dm_sustain 读取私聊持续对话配置 ==========
         dm_sustain = cfg.get("section_dm_sustain", {})
@@ -282,6 +286,14 @@ class DebouncePlugin(BasePlugin):
         return False
 
     # ========== 群聊持续对话 ==========
+    def _is_sustain_allowed(self, sid: str) -> bool:
+        """群聊持续对话作用域检查：白名单非空时仅白名单内生效；白名单为空时排除黑名单。"""
+        if self.sustain_allowed_sessions:
+            return sid in self.sustain_allowed_sessions
+        if self.sustain_denied_sessions:
+            return sid not in self.sustain_denied_sessions
+        return True
+
     def _is_in_sustain_window(self, sid: str) -> bool:
         return time.time() < self.sustain_until[sid]
 
@@ -709,13 +721,13 @@ class DebouncePlugin(BasePlugin):
 
         # === 群聊持续对话 ===
         # 真实唤醒（@ / 唤醒词）：开启新一轮，重置连续计数
-        if self.sustain_enabled and event.is_group_message() and event.is_mentioned:
+        if self.sustain_enabled and event.is_group_message() and event.is_mentioned and self._is_sustain_allowed(sid):
             if self.sustain_count.get(sid, 0) or self._is_in_sustain_window(sid):
                 logger.debug(f"[Sustain] 群 {sid} 真实唤醒，重置连续计数（原 {self.sustain_count.get(sid, 0)}）")
             self.sustain_count[sid] = 0
             self._clear_sustain_window(sid, keep_count=True)
 
-        if self.sustain_enabled and event.is_group_message() and not event.is_mentioned:
+        if self.sustain_enabled and event.is_group_message() and not event.is_mentioned and self._is_sustain_allowed(sid):
             if self._is_in_sustain_window(sid):
                 if self.max_sustain_replies != -1 and self.sustain_count[sid] >= self.max_sustain_replies:
                     self._clear_sustain_state(sid)
@@ -875,7 +887,7 @@ class DebouncePlugin(BasePlugin):
                         )
 
         # === 群聊持续对话 ===
-        if event.is_group_message() and self.sustain_enabled:
+        if event.is_group_message() and self.sustain_enabled and self._is_sustain_allowed(sid):
             should_stop = False
             if self.stop_on_ai_empty and self._is_empty_msg(ai_text):
                 should_stop = True
@@ -932,6 +944,30 @@ class DebouncePlugin(BasePlugin):
                 if p.name == "chat_env":
                     p.content += self.group_chat_prompt
                     break
+
+    @on.llm_request(priority=Priority.MEDIUM)
+    async def sustain_open_on_llm_request(self, event: KiraMessageBatchEvent, req: LLMRequest, *_):
+        """LLM 请求时兜底开窗：覆盖 LLM 处理期间（含工具循环）到达的消息。
+
+        未开启时，窗口只在 AI 回复后打开，LLM 处理期间到达的消息全部进缓冲，
+        若期间无新消息触发 flush，这些消息永远不会被处理。
+        开启后：LLM 请求（含工具循环中间步）时若窗口不在则保底开窗，
+        窗口内的消息可正常判定/命中；窗口在时完全不动（不刷新不关闭），
+        由 on_llm_response 在最终回复时续期。
+        """
+        if not self.sustain_enabled or not self.sustain_judge_on_llm_request:
+            return
+        if not event.is_group_message():
+            return
+        sid = event.sid
+        if not self._is_sustain_allowed(sid):
+            return
+        if self._is_in_sustain_window(sid):
+            return
+        if self.max_sustain_replies != -1 and self.sustain_count.get(sid, 0) >= self.max_sustain_replies:
+            return
+        self._start_sustain_window(sid)
+        logger.debug(f"[Sustain] 群 {sid} LLM 请求兜底开窗（连续次数 {self.sustain_count.get(sid, 0)}）")
 
     # ================= 队列合并 / 积压处理（转发给 BatchMergeScheduler） =================
 

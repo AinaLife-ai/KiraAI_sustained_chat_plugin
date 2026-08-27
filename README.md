@@ -1,4 +1,4 @@
-# KiraAI_sustained_chat_plugin/可持续聊天 2.2.5
+# KiraAI_sustained_chat_plugin/可持续聊天 2.3.0
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI_sustained_chat_plugin)
 
@@ -41,6 +41,14 @@ Shana: 牛肉面！听起来好香，我也想吃！
 - ✅ 可配置窗口时间、回复概率、最大连续回复次数
 - ✅ 支持 `per_message`（每条消息独立判断）和 `per_round`（窗口内只判断一次）两种模式
 - ✅ 支持停止关键词（用户/AI说“别聊了”即可终止）
+- ✅ 支持群聊作用域白名单/黑名单（`sustain_allowed_sessions` / `sustain_denied_sessions`），精准控制哪些群启用
+- ✅ **LLM 请求时兜底开窗**（`sustain_judge_on_llm_request`，默认开启）：LLM 处理期间（含工具循环）到达的消息也能被判定，不再只进缓冲等下一次触发
+
+> **为什么需要「LLM 请求时开窗」？**
+>
+> 未开启时，持续窗口只在 AI 回复后打开。若 AI 正在处理一条消息（LLM 请求 + 工具循环可能持续数十秒），期间群友发来的消息全部进入缓冲队列——如果之后没有新消息触发 flush，这些消息就永远不会被处理，AI 会“错过”群里的对话。
+>
+> 开启后，LLM 每次请求（含工具循环中间步）时若窗口不在，则保底开窗；窗口内的消息可正常判定、命中即回复。窗口已存在时完全不动（不刷新不关闭），由 AI 最终回复时续期，行为与旧版一致。
 
 ---
 
@@ -225,12 +233,21 @@ croniter>=1.3.0
 
 ## 📝 版本信息
 
-- 当前版本：v2.2.5
+- 当前版本：v2.3.0
 - 兼容 KiraAI：v2.29.7+
 - 作者：KiraAI + znq19
 
 <details>
 <summary>更新日志</summary>
+
+### v2.3.0
+
+**群聊持续对话：作用域控制 + LLM 请求时兜底开窗**
+
+- **群聊作用域白名单/黑名单**（`sustain_allowed_sessions` / `sustain_denied_sessions`）：白名单非空时仅白名单内群生效；白名单为空时排除黑名单。格式如 `qq:gm:123456`，与私聊黑白名单语义一致
+- **LLM 请求时兜底开窗**（`sustain_judge_on_llm_request`，默认 `true`）：LLM 请求（含工具循环中间步）时若窗口不在则保底开窗，覆盖 LLM 处理期间到达的消息——此前这些消息只进缓冲，无新消息触发 flush 时永远不会被处理（AI 会“错过”群聊）。窗口已存在时完全不动（不刷新不关闭），由 AI 最终回复续期，行为与旧版一致
+- 作用域检查同时应用于消息判定与 AI 回复开窗，黑白名单外的群完全不受持续对话影响
+- 新增插件图标（`icon.png`，manifest 增加 `icon` 字段，遵循 KiraAI 最新 manifest 图标规范）
 
 ### v2.2.5
 
