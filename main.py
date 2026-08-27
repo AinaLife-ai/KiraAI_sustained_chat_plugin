@@ -63,10 +63,10 @@ class DebouncePlugin(BasePlugin):
         self.stop_on_ai_keywords = group_sustain.get("stop_on_ai_keywords", [])
         self.stop_on_ai_empty = group_sustain.get("stop_on_ai_empty", True)
         self.sustain_mode = group_sustain.get("sustain_mode", "per_message")
-        # 新增：群聊持续对话作用域（白名单/黑名单）与 LLM 请求时开窗判定
+        # 新增：群聊持续对话作用域（白名单/黑名单）与判定时机
         self.sustain_allowed_sessions = group_sustain.get("sustain_allowed_sessions", [])
         self.sustain_denied_sessions = group_sustain.get("sustain_denied_sessions", [])
-        self.sustain_judge_on_llm_request = group_sustain.get("sustain_judge_on_llm_request", True)
+        self.sustain_judge_timing = group_sustain.get("sustain_judge_timing", "both")
 
         # ========== 从 section_dm_sustain 读取私聊持续对话配置 ==========
         dm_sustain = cfg.get("section_dm_sustain", {})
@@ -141,7 +141,7 @@ class DebouncePlugin(BasePlugin):
         logger.info(f"[Debounce] 唤醒词: {self.waking_words}")
         logger.info(f"[Debounce] 接收非唤醒消息: {self.receive_unmentioned}")
         if self.sustain_enabled:
-            logger.info(f"[Debounce] 群聊持续对话已启用: mode={self.sustain_mode}, window={self.sustain_window_seconds}s, prob={self.sustain_reply_probability}, max={self.max_sustain_replies}")
+            logger.info(f"[Debounce] 群聊持续对话已启用: mode={self.sustain_mode}, window={self.sustain_window_seconds}s, prob={self.sustain_reply_probability}, max={self.max_sustain_replies}, timing={self.sustain_judge_timing}")
         if self.dm_sustain_enabled:
             logger.info(f"[Debounce] 私聊持续对话已启用: mode={self.dm_sustain_mode}, window_range={self.dm_sustain_window_range}, prob={self.dm_sustain_reply_probability}, max={self.dm_max_sustain_replies}, retry_max={self.dm_max_retry_attempts}")
             if self.dm_allowed_users:
@@ -267,16 +267,7 @@ class DebouncePlugin(BasePlugin):
         pattern = r'^\s*<msg\s*/>\s*$|^\s*<msg>\s*</msg>\s*$'
         return bool(re.match(pattern, xml))
 
-    def _check_ai_stop_keywords(self, text: str, keywords: List[str]) -> bool:
-        if not keywords:
-            return False
-        text_lower = text.lower()
-        for kw in keywords:
-            if kw.lower() in text_lower:
-                return True
-        return False
-
-    def _check_user_stop_keywords(self, text: str, keywords: List[str]) -> bool:
+    def _check_stop_keywords(self, text: str, keywords: List[str]) -> bool:
         if not keywords:
             return False
         text_lower = text.lower()
@@ -311,12 +302,13 @@ class DebouncePlugin(BasePlugin):
             await asyncio.sleep(self.sustain_window_seconds)
         except asyncio.CancelledError:
             return
-        # 超时后整状态清除（含计数），结束本轮持续对话
+        # 超时后清除窗口但保留连续计数（count 只在真实唤醒时清零），
+        # 避免长 LLM 处理（工具循环超过窗口时长）绕过 max_sustain_replies 限制
         # 若窗口已被提前关闭/刷新，deadline 会变化或消失，避免误清
         deadline = self.sustain_until.get(sid, 0)
         if deadline and time.time() >= deadline:
-            self._clear_sustain_state(sid)
-            logger.debug(f"[Sustain] 群 {sid} 持续窗口超时结束")
+            self._clear_sustain_window(sid, keep_count=True)
+            logger.debug(f"[Sustain] 群 {sid} 持续窗口超时结束（保留计数 {self.sustain_count.get(sid, 0)}）")
 
     def _clear_sustain_window(self, sid: str, keep_count: bool = False):
         """清除群聊持续窗口状态。
@@ -696,7 +688,7 @@ class DebouncePlugin(BasePlugin):
                 in_window = self._is_in_dm_sustain(sid)
 
                 # 仅在持续窗口内处理停止词（避免非窗口期误丢弃正常消息）
-                if in_window and self._check_user_stop_keywords(
+                if in_window and self._check_stop_keywords(
                     text_content, self.dm_sustain_stop_keywords
                 ):
                     if self.dm_sustain_mode == "per_retry" and self.dm_retry_on_user_stop:
@@ -733,7 +725,7 @@ class DebouncePlugin(BasePlugin):
                     self._clear_sustain_state(sid)
                 else:
                     text_content = "".join(elem.text for elem in event.message.chain if isinstance(elem, Text))
-                    if self._check_user_stop_keywords(text_content, self.sustain_stop_keywords):
+                    if self._check_stop_keywords(text_content, self.sustain_stop_keywords):
                         self._clear_sustain_state(sid)
                         event.discard()
                         return
@@ -866,7 +858,7 @@ class DebouncePlugin(BasePlugin):
                     if self.dm_stop_on_ai_empty and self._is_empty_msg(ai_text):
                         should_stop = True
                         stop_reason = "空消息"
-                    elif self._check_ai_stop_keywords(ai_text, self.dm_stop_on_ai_keywords):
+                    elif self._check_stop_keywords(ai_text, self.dm_stop_on_ai_keywords):
                         should_stop = True
                         stop_reason = "AI停止关键词"
 
@@ -892,7 +884,7 @@ class DebouncePlugin(BasePlugin):
             if self.stop_on_ai_empty and self._is_empty_msg(ai_text):
                 should_stop = True
                 logger.debug(f"[Sustain] AI 输出空消息，停止窗口: {sid}")
-            elif self._check_ai_stop_keywords(ai_text, self.stop_on_ai_keywords):
+            elif self._check_stop_keywords(ai_text, self.stop_on_ai_keywords):
                 should_stop = True
                 logger.debug(f"[Sustain] AI 回复包含停止关键词，停止窗口: {sid}")
 
@@ -901,11 +893,19 @@ class DebouncePlugin(BasePlugin):
                 return
 
             if self.max_sustain_replies == -1 or self.sustain_count[sid] < self.max_sustain_replies:
-                self._start_sustain_window(sid)
-                logger.debug(
-                    f"[Sustain] 群 {sid} AI 回复完成，启动窗口 "
-                    f"（连续次数 {self.sustain_count.get(sid, 0)}）"
-                )
+                if self.sustain_judge_timing == "llm_processing":
+                    # 判定仅在 LLM 处理期间进行，回复后不开窗
+                    logger.debug(f"[Sustain] 群 {sid} timing=llm_processing，回复后不开窗")
+                elif self.sustain_judge_timing == "either" and self._is_in_sustain_window(sid):
+                    # either：兜底窗口仍在则延续不重置（一轮只判一次），
+                    # 由兜底窗口自然结束；窗口不在才开新窗
+                    logger.debug(f"[Sustain] 群 {sid} timing=either，窗口延续不重置")
+                else:
+                    self._start_sustain_window(sid)
+                    logger.debug(
+                        f"[Sustain] 群 {sid} AI 回复完成，启动窗口 "
+                        f"（连续次数 {self.sustain_count.get(sid, 0)}）"
+                    )
             else:
                 logger.debug(
                     f"[Sustain] 群 {sid} 已达最大持续次数 "
@@ -949,13 +949,15 @@ class DebouncePlugin(BasePlugin):
     async def sustain_open_on_llm_request(self, event: KiraMessageBatchEvent, req: LLMRequest, *_):
         """LLM 请求时兜底开窗：覆盖 LLM 处理期间（含工具循环）到达的消息。
 
-        未开启时，窗口只在 AI 回复后打开，LLM 处理期间到达的消息全部进缓冲，
-        若期间无新消息触发 flush，这些消息永远不会被处理。
-        开启后：LLM 请求（含工具循环中间步）时若窗口不在则保底开窗，
-        窗口内的消息可正常判定/命中；窗口在时完全不动（不刷新不关闭），
-        由 on_llm_response 在最终回复时续期。
+        sustain_judge_timing 控制判定时机：
+        - both / either / llm_processing：LLM 请求时若窗口不在则保底开窗，
+          窗口内的消息可正常判定/命中；窗口在时完全不动（不刷新不关闭）
+        - after_reply：处理期间只接住消息不判定，不开窗
+        窗口续期由 on_llm_response 在最终回复时按 timing 策略处理。
         """
-        if not self.sustain_enabled or not self.sustain_judge_on_llm_request:
+        if not self.sustain_enabled:
+            return
+        if self.sustain_judge_timing == "after_reply":
             return
         if not event.is_group_message():
             return
