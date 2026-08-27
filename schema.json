@@ -181,11 +181,17 @@
                 "default": [],
                 "hint": "排除这些 sid，白名单为空时生效。格式如 qq:gm:123456"
             },
-            "sustain_judge_on_llm_request": {
-                "name": "LLM请求时开窗判定",
-                "type": "switch",
-                "default": true,
-                "hint": "开启后，LLM 请求（含工具循环中间步）时若窗口不在则保底开窗，覆盖 LLM 处理期间到达的消息（否则这些消息只进缓冲、无新消息触发时永远不会被处理）；窗口在时不动，由 AI 最终回复续期"
+            "sustain_judge_timing": {
+                "name": "持续回复判定时机",
+                "type": "enum",
+                "options": [
+                    "both",
+                    "either",
+                    "llm_processing",
+                    "after_reply"
+                ],
+                "default": "both",
+                "hint": "both: LLM 处理期间与回复后两个时机都判定；either: 任一时机判定，窗口重叠时一轮只判一次；llm_processing: 仅 LLM 处理期间判定；after_reply: 仅 LLM 回复后判定（处理期间消息只接住不判）"
             }
         }
     },
