@@ -553,11 +553,12 @@ class ParallelMediaRecognizer:
                 new_text = self._fill_text(text, results)
                 if new_text != text:
                     p.content = new_text
-            # 兜底处理完毕：清理本会话暂存媒体索引，防单 sid 无限累积（内存泄漏）。
-            # stage2 的 setdefault+update 是同步原子块，pop 后新批次会重建，无并发风险
-            self._round_media.pop(event.sid, None)
         except Exception:
             logger.exception("[MediaRecognize] stage3 error")
+        finally:
+            # 无论正常/异常/提前 return 都清理本会话暂存媒体索引，防单 sid 无限累积（内存泄漏）。
+            # stage2 的 setdefault+update 是同步原子块，pop 后新批次会重建，无并发风险
+            self._round_media.pop(event.sid, None)
 
     # ================= 填充 =================
 
