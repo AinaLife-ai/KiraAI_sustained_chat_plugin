@@ -63,7 +63,7 @@ class DebouncePlugin(BasePlugin):
         self.stop_on_ai_keywords = group_sustain.get("stop_on_ai_keywords", [])
         self.stop_on_ai_empty = group_sustain.get("stop_on_ai_empty", True)
         self.sustain_mode = group_sustain.get("sustain_mode", "per_message")
-        # 新增：群聊持续对话作用域（白名单/黑名单）与判定时机
+        # 新增：群聊持续对话作用域（白名单/黑名单）与 LLM 请求时开窗判定
         self.sustain_allowed_sessions = group_sustain.get("sustain_allowed_sessions", [])
         self.sustain_denied_sessions = group_sustain.get("sustain_denied_sessions", [])
         self.sustain_judge_timing = group_sustain.get("sustain_judge_timing", "both")
@@ -141,7 +141,7 @@ class DebouncePlugin(BasePlugin):
         logger.info(f"[Debounce] 唤醒词: {self.waking_words}")
         logger.info(f"[Debounce] 接收非唤醒消息: {self.receive_unmentioned}")
         if self.sustain_enabled:
-            logger.info(f"[Debounce] 群聊持续对话已启用: mode={self.sustain_mode}, window={self.sustain_window_seconds}s, prob={self.sustain_reply_probability}, max={self.max_sustain_replies}, timing={self.sustain_judge_timing}")
+            logger.info(f"[Debounce] 群聊持续对话已启用: mode={self.sustain_mode}, window={self.sustain_window_seconds}s, prob={self.sustain_reply_probability}, max={self.max_sustain_replies}")
         if self.dm_sustain_enabled:
             logger.info(f"[Debounce] 私聊持续对话已启用: mode={self.dm_sustain_mode}, window_range={self.dm_sustain_window_range}, prob={self.dm_sustain_reply_probability}, max={self.dm_max_sustain_replies}, retry_max={self.dm_max_retry_attempts}")
             if self.dm_allowed_users:
@@ -278,12 +278,20 @@ class DebouncePlugin(BasePlugin):
 
     # ========== 群聊持续对话 ==========
     def _is_sustain_allowed(self, sid: str) -> bool:
-        """群聊持续对话作用域检查：白名单非空时仅白名单内生效；白名单为空时排除黑名单。"""
+        """群聊持续对话作用域检查：白名单非空时仅白名单内生效；白名单为空时排除黑名单。
+
+        群不在作用域内时顺带清理该群的残留状态（窗口/计数/判定标记），
+        避免群被移出白名单后 count 等脏状态一直留在内存。
+        """
         if self.sustain_allowed_sessions:
-            return sid in self.sustain_allowed_sessions
-        if self.sustain_denied_sessions:
-            return sid not in self.sustain_denied_sessions
-        return True
+            allowed = sid in self.sustain_allowed_sessions
+        elif self.sustain_denied_sessions:
+            allowed = sid not in self.sustain_denied_sessions
+        else:
+            allowed = True
+        if not allowed:
+            self._clear_sustain_state(sid)
+        return allowed
 
     def _is_in_sustain_window(self, sid: str) -> bool:
         return time.time() < self.sustain_until[sid]
@@ -894,8 +902,10 @@ class DebouncePlugin(BasePlugin):
 
             if self.max_sustain_replies == -1 or self.sustain_count[sid] < self.max_sustain_replies:
                 if self.sustain_judge_timing == "llm_processing":
-                    # 判定仅在 LLM 处理期间进行，回复后不开窗
-                    logger.debug(f"[Sustain] 群 {sid} timing=llm_processing，回复后不开窗")
+                    # 判定仅在 LLM 处理期间进行，回复后关闭兜底窗，
+                    # 避免 LLM 请求时开的固定时长窗口在回复后剩余时间内继续判定
+                    self._clear_sustain_window(sid, keep_count=True)
+                    logger.debug(f"[Sustain] 群 {sid} timing=llm_processing，回复后关闭窗口")
                 elif self.sustain_judge_timing == "either" and self._is_in_sustain_window(sid):
                     # either：兜底窗口仍在则延续不重置（一轮只判一次），
                     # 由兜底窗口自然结束；窗口不在才开新窗

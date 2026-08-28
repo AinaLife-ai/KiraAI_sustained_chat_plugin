@@ -248,11 +248,15 @@ croniter>=1.3.0
 
 **群聊持续对话：作用域控制 + 判定时机可配置**
 
+> ⚠️ **升级提醒**：默认判定时机为 `both`（LLM 处理期间 + 回复后都判定），老用户升级后，AI 处理消息期间群友的发言也会触发持续回复（此前只有回复后才判）。如果觉得 bot 变吵，可将 `sustain_judge_timing` 设为 `after_reply` 恢复旧行为。
+
 - **群聊作用域白名单/黑名单**（`sustain_allowed_sessions` / `sustain_denied_sessions`）：白名单非空时仅白名单内群生效；白名单为空时排除黑名单。格式如 `qq:gm:123456`，与私聊黑白名单语义一致
-- **判定时机**（`sustain_judge_timing`，默认 `both`）：`both` 两个时机都判定；`either` 窗口重叠时一轮只判一次；`llm_processing` 仅 LLM 处理期间判定；`after_reply` 仅回复后判定。LLM 处理期间兜底开窗覆盖处理中到达的消息——此前这些消息只进缓冲，无新消息触发 flush 时永远不会被处理（AI 会“错过”群聊）。窗口已存在时完全不动（不刷新不关闭），由 AI 最终回复按 timing 策略续期
+- **判定时机**（`sustain_judge_timing`，默认 `both`）：`both` 两个时机都判定；`either` 窗口重叠时一轮只判一次；`llm_processing` 仅 LLM 处理期间判定（回复后立即关闭兜底窗）；`after_reply` 仅回复后判定。LLM 处理期间兜底开窗覆盖处理中到达的消息——此前这些消息只进缓冲，无新消息触发 flush 时永远不会被处理（AI 会“错过”群聊）。窗口已存在时完全不动（不刷新不关闭），由 AI 最终回复按 timing 策略续期
 - **修复长 LLM 处理绕过 max_sustain_replies**：窗口超时清理保留连续计数（count 只在真实唤醒时清零），工具循环超过窗口时长不再导致计数归零
-- 作用域检查同时应用于消息判定与 AI 回复开窗，黑白名单外的群完全不受持续对话影响
+- 作用域检查同时应用于消息判定与 AI 回复开窗，黑白名单外的群完全不受持续对话影响；群被移出作用域时顺带清理残留的窗口/计数状态
 - 新增插件图标（`icon.png`，manifest 增加 `icon` 字段，遵循 KiraAI 最新 manifest 图标规范）
+
+> 💡 **注意**：`per_message` 模式 + 高回复概率 + 长工具循环的组合下，LLM 处理期间兜底开窗可能连续命中积压消息（每条命中都会触发一次回复），如不希望这样，建议降低 `sustain_reply_probability` 或改用 `llm_processing` / `after_reply` 时机。
 
 ### v2.2.5
 
