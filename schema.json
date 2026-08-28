@@ -53,7 +53,7 @@
             "image_recognition_only_on_mention": {
                 "name": "仅唤醒消息识图",
                 "type": "switch",
-                "default": true,
+                "default": false,
                 "hint": "为 true 时，只有唤醒消息中的图片/动画表情会保留（识别）；非唤醒消息中的全部替换为 [图片]。为 false 时，按概率和数量处理。"
             },
             "image_recognition_probability": {
@@ -80,13 +80,13 @@
             "voice_recognition_only_on_mention": {
                 "name": "仅唤醒消息识别语音（群聊）",
                 "type": "switch",
-                "default": true,
+                "default": false,
                 "hint": "为 true 时，只有唤醒消息中的语音会尝试识别；非唤醒消息中的语音替换为 [语音]。"
             },
             "voice_private_need_mention": {
                 "name": "私聊需要引用才识别语音",
                 "type": "switch",
-                "default": true,
+                "default": false,
                 "hint": "为 true 时，私聊中只有引用机器人（回复）的语音才尝试识别；为 false 时，私聊中所有语音都尝试识别（需 STT 模型）。"
             },
             "voice_max_duration": {
@@ -191,7 +191,7 @@
                     "after_reply"
                 ],
                 "default": "either",
-                "hint": "both: LLM 处理期间与回复后两个时机都判定；either: 任一时机判定，窗口重叠时一轮只判一次；llm_processing: 仅 LLM 处理期间判定；after_reply: 仅 LLM 回复后判定（处理期间消息只接住不判）"
+                "hint": "both: LLM 处理期间与回复后两个时机都判定；either: 任一时机判定，窗口重叠时一轮只判一次；llm_processing: 仅 LLM 处理期间判定；after_reply: 仅 LLM 回复后判定（本插件传统行为，处理期间消息只缓存不判）"
             }
         }
     },
