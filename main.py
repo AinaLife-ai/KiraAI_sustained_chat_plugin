@@ -315,7 +315,10 @@ class DebouncePlugin(BasePlugin):
         # 若窗口已被提前关闭/刷新，deadline 会变化或消失，避免误清
         deadline = self.sustain_until.get(sid, 0)
         if deadline and time.time() >= deadline:
-            self._clear_sustain_window(sid, keep_count=True)
+            # 直接清理字段，不走 _clear_sustain_window（避免 cancel 自身任务）
+            self.sustain_until.pop(sid, None)
+            self.sustain_tasks.pop(sid, None)
+            self.sustain_judged.pop(sid, None)
             logger.debug(f"[Sustain] 群 {sid} 持续窗口超时结束（保留计数 {self.sustain_count.get(sid, 0)}）")
 
     def _clear_sustain_window(self, sid: str, keep_count: bool = False):
@@ -846,9 +849,11 @@ class DebouncePlugin(BasePlugin):
 
         # provider 全挂时框架返回 "[ProviderError] ..." 错误文本（无 tool_calls，
         # agent_executor 标记 is_final=True 直接收尾）。它不是真实 AI 回复：若按正常
-        # 回复处理会误开持续窗口，在 provider 恢复前反复主动触发。识别后静默结束。
+        # 回复处理会误开持续窗口，在 provider 恢复前反复主动触发。识别后静默结束，
+        # 同时关闭 LLM 请求时兜底开的窗口，避免错误响应后窗口残留期间持续误判
         if ai_text.startswith("[ProviderError]"):
-            logger.debug(f"[Sustain] provider 全挂错误响应，不开窗: {sid}")
+            self._clear_sustain_window(sid, keep_count=True)
+            logger.debug(f"[Sustain] provider 全挂错误响应，关闭窗口不开窗: {sid}")
             return
 
         # === 私聊持续对话 ===
