@@ -560,8 +560,10 @@ class ParallelMediaRecognizer:
 
     def _fill_text(self, text: str, results: dict) -> str:
         for sid, desc in results.items():
-            text = re.sub(rf"\[Image #{re.escape(sid)}: \]", f"[Image #{sid}: {desc}]", text)
-            text = re.sub(rf"\[Record #{re.escape(sid)}: \]", f"[Record #{sid}: {desc}]", text)
+            # 用 str.replace 而非 re.sub：replacement 是模板字符串，desc 含 \U/\x 等
+            # 反斜杠序列（如 Windows 路径）会抛 bad escape；replace 无转义问题
+            text = text.replace(f"[Image #{sid}: ]", f"[Image #{sid}: {desc}]")
+            text = text.replace(f"[Record #{sid}: ]", f"[Record #{sid}: {desc}]")
         return text
 
     def _fill_chain(self, chain, results: dict):
@@ -572,10 +574,10 @@ class ParallelMediaRecognizer:
                 m = _ALL_RE.match(elem.text or "")
                 if m and not m.group(2).strip() and m.group(1) in results:
                     prefix = "Image" if elem.text.startswith("[Image") else "Record"
-                    elem.text = re.sub(
-                        rf"\[(?:Image|Record) #{re.escape(m.group(1))}: \]",
+                    # 同上：replacement 模板转义问题，用 replace 替代 re.sub
+                    elem.text = elem.text.replace(
+                        f"[{prefix} #{m.group(1)}: ]",
                         f"[{prefix} #{m.group(1)}: {results[m.group(1)]}]",
-                        elem.text,
                     )
             elif isinstance(elem, Reply):
                 self._fill_chain(getattr(elem, "chain", None), results)

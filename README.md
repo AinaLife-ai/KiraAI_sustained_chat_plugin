@@ -1,4 +1,4 @@
-# KiraAI_sustained_chat_plugin/可持续聊天 2.3.0
+# KiraAI_sustained_chat_plugin/可持续聊天 2.3.1
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI_sustained_chat_plugin)
 
@@ -237,12 +237,18 @@ croniter>=1.3.0
 
 ## 📝 版本信息
 
-- 当前版本：v2.3.0
+- 当前版本：v2.3.1
 - 兼容 KiraAI：v2.29.6+（插件图标需 v2.30.0+）
 - 作者：KiraAI + znq19
 
 <details>
 <summary>更新日志</summary>
+
+### v2.3.1
+
+**修复媒体识别填充崩溃（bad escape）**
+
+- `_fill_text` / `_fill_chain` 的 `re.sub` 改为 `str.replace`：`re.sub` 的 replacement 是模板字符串，VLM/STT 返回的描述含反斜杠序列（如 Windows 路径 `C:\Users\...` 的 `\U`、`\x`）时抛 `re.PatternError: bad escape`，stage2 整批媒体识别崩溃。占位符是精确字面量，`str.replace` 无转义问题
 
 ### v2.3.0
 
