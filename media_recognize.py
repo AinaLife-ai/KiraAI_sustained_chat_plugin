@@ -555,13 +555,19 @@ class ParallelMediaRecognizer:
                     p.content = new_text
         except Exception:
             logger.exception("[MediaRecognize] stage3 error")
+        finally:
+            # 无论正常/异常/提前 return 都清理本会话暂存媒体索引，防单 sid 无限累积（内存泄漏）。
+            # stage2 的 setdefault+update 是同步原子块，pop 后新批次会重建，无并发风险
+            self._round_media.pop(event.sid, None)
 
     # ================= 填充 =================
 
     def _fill_text(self, text: str, results: dict) -> str:
         for sid, desc in results.items():
-            text = re.sub(rf"\[Image #{re.escape(sid)}: \]", f"[Image #{sid}: {desc}]", text)
-            text = re.sub(rf"\[Record #{re.escape(sid)}: \]", f"[Record #{sid}: {desc}]", text)
+            # 用 str.replace 而非 re.sub：replacement 是模板字符串，desc 含 \U/\x 等
+            # 反斜杠序列（如 Windows 路径）会抛 bad escape；replace 无转义问题
+            text = text.replace(f"[Image #{sid}: ]", f"[Image #{sid}: {desc}]")
+            text = text.replace(f"[Record #{sid}: ]", f"[Record #{sid}: {desc}]")
         return text
 
     def _fill_chain(self, chain, results: dict):
@@ -569,14 +575,11 @@ class ParallelMediaRecognizer:
             return
         for elem in chain:
             if isinstance(elem, Text):
-                m = _ALL_RE.match(elem.text or "")
-                if m and not m.group(2).strip() and m.group(1) in results:
-                    prefix = "Image" if elem.text.startswith("[Image") else "Record"
-                    elem.text = re.sub(
-                        rf"\[(?:Image|Record) #{re.escape(m.group(1))}: \]",
-                        f"[{prefix} #{m.group(1)}: {results[m.group(1)]}]",
-                        elem.text,
-                    )
+                # 与 _fill_text 一致：全文 replace（不依赖 match 只匹配开头），
+                # 避免 Text 前有前缀时 chain 漏填而 message_str 已填的不一致
+                new_text = self._fill_text(elem.text or "", results)
+                if new_text != elem.text:
+                    elem.text = new_text
             elif isinstance(elem, Reply):
                 self._fill_chain(getattr(elem, "chain", None), results)
             elif isinstance(elem, Forward):
