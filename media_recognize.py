@@ -553,6 +553,9 @@ class ParallelMediaRecognizer:
                 new_text = self._fill_text(text, results)
                 if new_text != text:
                     p.content = new_text
+            # 兜底处理完毕：清理本会话暂存媒体索引，防单 sid 无限累积（内存泄漏）。
+            # stage2 的 setdefault+update 是同步原子块，pop 后新批次会重建，无并发风险
+            self._round_media.pop(event.sid, None)
         except Exception:
             logger.exception("[MediaRecognize] stage3 error")
 
@@ -571,14 +574,11 @@ class ParallelMediaRecognizer:
             return
         for elem in chain:
             if isinstance(elem, Text):
-                m = _ALL_RE.match(elem.text or "")
-                if m and not m.group(2).strip() and m.group(1) in results:
-                    prefix = "Image" if elem.text.startswith("[Image") else "Record"
-                    # 同上：replacement 模板转义问题，用 replace 替代 re.sub
-                    elem.text = elem.text.replace(
-                        f"[{prefix} #{m.group(1)}: ]",
-                        f"[{prefix} #{m.group(1)}: {results[m.group(1)]}]",
-                    )
+                # 与 _fill_text 一致：全文 replace（不依赖 match 只匹配开头），
+                # 避免 Text 前有前缀时 chain 漏填而 message_str 已填的不一致
+                new_text = self._fill_text(elem.text or "", results)
+                if new_text != elem.text:
+                    elem.text = new_text
             elif isinstance(elem, Reply):
                 self._fill_chain(getattr(elem, "chain", None), results)
             elif isinstance(elem, Forward):
