@@ -66,7 +66,7 @@ class DebouncePlugin(BasePlugin):
         # 新增：群聊持续对话作用域（白名单/黑名单）与 LLM 请求时开窗判定
         self.sustain_allowed_sessions = group_sustain.get("sustain_allowed_sessions", [])
         self.sustain_denied_sessions = group_sustain.get("sustain_denied_sessions", [])
-        self.sustain_judge_timing = group_sustain.get("sustain_judge_timing", "both")
+        self.sustain_judge_timing = group_sustain.get("sustain_judge_timing", "either")
 
         # ========== 从 section_dm_sustain 读取私聊持续对话配置 ==========
         dm_sustain = cfg.get("section_dm_sustain", {})
