@@ -1,4 +1,4 @@
-# KiraAI_sustained_chat_plugin/可持续聊天 2.2.5
+# KiraAI_sustained_chat_plugin/可持续聊天 2.3.0
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI_sustained_chat_plugin)
 
@@ -41,6 +41,18 @@ Shana: 牛肉面！听起来好香，我也想吃！
 - ✅ 可配置窗口时间、回复概率、最大连续回复次数
 - ✅ 支持 `per_message`（每条消息独立判断）和 `per_round`（窗口内只判断一次）两种模式
 - ✅ 支持停止关键词（用户/AI说“别聊了”即可终止）
+- ✅ 支持群聊作用域白名单/黑名单（`sustain_allowed_sessions` / `sustain_denied_sessions`），精准控制哪些群启用
+- ✅ **判定时机可配置**（`sustain_judge_timing`，默认 `either`）：LLM 处理期间与回复后两个时机都判定，也可只选其一或重叠时一轮只判一次
+
+> **为什么需要「判定时机」？**
+>
+> 持续窗口只在 AI 回复后打开时，若 AI 正在处理一条消息（LLM 请求 + 工具循环可能持续数十秒），期间群友发来的消息全部进入缓冲队列——如果之后没有新消息触发 flush，这些消息就永远不会被处理，AI 会“错过”群里的对话。
+>
+> `sustain_judge_timing` 控制判定时机：
+> - `both`：LLM 处理期间（含工具循环）与回复后两个时机都判定，消息不丢且接话自然
+> - `either`（默认）：任一时机判定，窗口重叠时一轮只判一次（per_round 下严格保持“一轮只判一次”）
+> - `llm_processing`：仅 LLM 处理期间判定，回复后不开窗
+> - `after_reply`：仅 LLM 回复后判定，处理期间消息只接住不判（持续感最强，传统行为）
 
 ---
 
@@ -225,12 +237,26 @@ croniter>=1.3.0
 
 ## 📝 版本信息
 
-- 当前版本：v2.2.5
-- 兼容 KiraAI：v2.29.7+
+- 当前版本：v2.3.0
+- 兼容 KiraAI：v2.29.6+（插件图标需 v2.30.0+）
 - 作者：KiraAI + znq19
 
 <details>
 <summary>更新日志</summary>
+
+### v2.3.0
+
+**群聊持续对话：作用域控制 + 判定时机可配置**
+
+> ⚠️ **升级提醒**：默认判定时机为 `either`（LLM 处理期间 + 回复后都判，窗口重叠时一轮只判一次），老用户升级后，AI 处理消息期间群友的发言也会触发持续回复（此前只有回复后才判）。如果觉得 bot 变吵，可将 `sustain_judge_timing` 设为 `after_reply` 恢复旧行为。
+
+- **群聊作用域白名单/黑名单**（`sustain_allowed_sessions` / `sustain_denied_sessions`）：白名单非空时仅白名单内群生效；白名单为空时排除黑名单。格式如 `qq:gm:123456`，与私聊黑白名单语义一致
+- **判定时机**（`sustain_judge_timing`，默认 `either`）：`both` 两个时机都判定；`either` 窗口重叠时一轮只判一次；`llm_processing` 仅 LLM 处理期间判定（回复后立即关闭兜底窗）；`after_reply` 仅回复后判定。LLM 处理期间兜底开窗覆盖处理中到达的消息——此前这些消息只进缓冲，无新消息触发 flush 时永远不会被处理（AI 会“错过”群聊）。窗口已存在时完全不动（不刷新不关闭），由 AI 最终回复按 timing 策略续期
+- **修复长 LLM 处理绕过 max_sustain_replies**：窗口超时清理保留连续计数（count 只在真实唤醒时清零），工具循环超过窗口时长不再导致计数归零
+- 作用域检查同时应用于消息判定与 AI 回复开窗，黑白名单外的群完全不受持续对话影响；群被移出作用域时顺带清理残留的窗口/计数状态
+- 新增插件图标（`icon.png`，manifest 增加 `icon` 字段，遵循 KiraAI 最新 manifest 图标规范）
+
+> 💡 **注意**：`per_message` 模式 + 高回复概率 + 长工具循环的组合下，LLM 处理期间兜底开窗可能连续命中积压消息（每条命中都会触发一次回复），如不希望这样，建议降低 `sustain_reply_probability` 或改用 `llm_processing` / `after_reply` 时机。
 
 ### v2.2.5
 

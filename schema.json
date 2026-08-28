@@ -168,6 +168,30 @@
                 ],
                 "default": "per_round",
                 "hint": "per_message: 窗口内每条非唤醒消息独立判断概率；per_round: 窗口内只判断第一条非唤醒消息，后续不再判断"
+            },
+            "sustain_allowed_sessions": {
+                "name": "群聊白名单（sid）",
+                "type": "list",
+                "default": [],
+                "hint": "仅对这些 sid 生效，填写后黑名单失效。格式如 qq:gm:123456"
+            },
+            "sustain_denied_sessions": {
+                "name": "群聊黑名单（sid）",
+                "type": "list",
+                "default": [],
+                "hint": "排除这些 sid，白名单为空时生效。格式如 qq:gm:123456"
+            },
+            "sustain_judge_timing": {
+                "name": "持续回复判定时机",
+                "type": "enum",
+                "options": [
+                    "both",
+                    "either",
+                    "llm_processing",
+                    "after_reply"
+                ],
+                "default": "either",
+                "hint": "both: LLM 处理期间与回复后两个时机都判定；either: 任一时机判定，窗口重叠时一轮只判一次；llm_processing: 仅 LLM 处理期间判定；after_reply: 仅 LLM 回复后判定（处理期间消息只接住不判）"
             }
         }
     },
