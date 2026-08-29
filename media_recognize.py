@@ -278,7 +278,33 @@ class ParallelMediaRecognizer:
             short_id = f"noid_{id(elem)}"
             desc = ""
         media[short_id] = {"md5": md5, "elem": elem, "type": mtype, "_done": bool(desc)}
+        if desc:
+            # 缓存命中：直接带 file_path（to_path 幂等，_temp_path 已缓存不重复下载），
+            # 对齐原版 message_format_to_text 的 [Image desc, file_path: xxx] 格式
+            p = await self._media_path(elem)
+            if p:
+                return Text(f"[{mtype} #{short_id}: {desc}, file_path: {p}]")
         return Text(f"[{mtype} #{short_id}: {desc}]")
+
+    async def _media_path(self, elem) -> Optional[str]:
+        """对齐原版 message_format_to_text：to_path 落盘后转 data/ 相对路径。
+
+        原版（core/message_manager.py Image 分支）：to_path() → relative_to(data_dir)
+        → "data/xxx"，失败降级绝对路径。本模块 stage1 把媒体替换为标识符绕过了
+        原版渲染，这里补回 file_path，让 LLM 能拿到本地路径做图生图/上传等。
+        """
+        try:
+            from pathlib import Path
+            from core.utils.path_utils import get_data_path
+            path = Path(await elem.to_path())
+            data_dir = get_data_path()
+            try:
+                rel = path.relative_to(data_dir)
+                return f"data/{rel}"
+            except ValueError:
+                return str(path)
+        except Exception:
+            return None
 
     async def _record_md5(self, elem) -> Optional[str]:
         """音频指纹：to_base64 后取 md5（Record 无 hash_image）。"""
