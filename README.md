@@ -1,4 +1,4 @@
-# KiraAI_sustained_chat_plugin/可持续聊天 2.3.1
+# KiraAI_sustained_chat_plugin/可持续聊天 2.3.2
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI_sustained_chat_plugin)
 
@@ -170,6 +170,7 @@ AI: 对了主人，我刚刚看到一个好笑的视频，想不想看？
 - ✅ 队列合并默认"不攒批"（当前批次一完成立即合并推送），软合并/超时合并阈值可配（`section_queue_merge`）
 - ✅ 并行媒体识别可配最大并行图片数/语音数、兼容并行识图插件分工（`section_media_recognition`）
 - ✅ 两个新模块均默认开启、可独立关闭，关闭后行为与旧版完全一致
+- ✅ **媒体识别填充 file_path**（v2.3.2）：识别后的图片标识符带本地文件路径（`[Image #id: 描述, file_path: data/temp/xxx.jpg]`），对齐原版 `message_format_to_text` 行为，LLM 可直接用路径做图生图/上传等操作
 
 ---
 
@@ -237,12 +238,21 @@ croniter>=1.3.0
 
 ## 📝 版本信息
 
-- 当前版本：v2.3.1
+- 当前版本：v2.3.2
 - 兼容 KiraAI：v2.29.6+（插件图标需 v2.30.0+）
 - 作者：KiraAI + znq19
 
 <details>
 <summary>更新日志</summary>
+
+### v2.3.2
+
+**媒体识别填充 file_path，对齐原版图片路径**
+
+- 并行媒体识别把 Image/Sticker 替换为标识符后，LLM 拿不到本地文件路径，图生图/上传等工具找不到文件。现在 stage1（缓存命中）/ stage2（识别完成）/ stage3（历史兜底）都会对媒体调用 `to_path()` 落盘并转 `data/` 相对路径，填充为 `[Image #id: 描述, file_path: data/temp/xxx.jpg]`，对齐原版 `message_format_to_text` 行为
+- 路径获取失败时降级为旧格式（不带 file_path）；`#id` 前缀保留，stage3 兜底正则、队列合并重放 `_done` 跳过逻辑不受影响
+- Record 原版也不带路径，行为不变；File/Video 未被替换，仍走框架原逻辑，不动
+- native 多模态模式行为不变（原版 native 也是 `[Image attached]` 不带路径）
 
 ### v2.3.1
 
