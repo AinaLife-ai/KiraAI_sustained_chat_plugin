@@ -372,13 +372,23 @@ class ParallelMediaRecognizer:
                         coros.append(self._transcribe_one(sess_sid, short_id, info, results, batch_sem=batch_aud_sem))
             await asyncio.gather(*coros, return_exceptions=True)
 
+            # 预取 file_path（to_path 落盘 + data/ 相对路径），填充时带上，
+            # 对齐原版 message_format_to_text 的 [Image desc, file_path: xxx] 格式
+            paths: dict[str, str] = {}
+            for _, media in tasks:
+                for sid, info in media.items():
+                    if sid in results and sid not in paths and info.get("elem") is not None:
+                        p = await self._media_path(info["elem"])
+                        if p:
+                            paths[sid] = p
+
             # 填充 message_str 与 chain
             for message, media in tasks:
                 hit = any(sid in results for sid in media)
                 if hit:
                     if message.message_str:
-                        message.message_str = self._fill_text(message.message_str, results)
-                    self._fill_chain(message.chain, results)
+                        message.message_str = self._fill_text(message.message_str, results, paths)
+                    self._fill_chain(message.chain, results, paths)
         except Exception:
             logger.exception("[MediaRecognize] stage2 error")
 
@@ -574,9 +584,17 @@ class ParallelMediaRecognizer:
                     results[media_id] = "(已过期)"
             if coros:
                 await asyncio.gather(*coros, return_exceptions=True)
+            # 预取 file_path（stage3 兜底同样带路径，与 stage1/stage2 格式一致）
+            paths: dict[str, str] = {}
+            for media_id in need:
+                info = round_media.get(media_id)
+                if info and info.get("elem") is not None:
+                    p = await self._media_path(info["elem"])
+                    if p:
+                        paths[media_id] = p
             for p in getattr(req, "user_prompt", []) or []:
                 text = getattr(p, "content", "") or ""
-                new_text = self._fill_text(text, results)
+                new_text = self._fill_text(text, results, paths)
                 if new_text != text:
                     p.content = new_text
         except Exception:
@@ -588,29 +606,32 @@ class ParallelMediaRecognizer:
 
     # ================= 填充 =================
 
-    def _fill_text(self, text: str, results: dict) -> str:
+    def _fill_text(self, text: str, results: dict, paths: Optional[dict] = None) -> str:
         for sid, desc in results.items():
             # 用 str.replace 而非 re.sub：replacement 是模板字符串，desc 含 \U/\x 等
             # 反斜杠序列（如 Windows 路径）会抛 bad escape；replace 无转义问题
-            text = text.replace(f"[Image #{sid}: ]", f"[Image #{sid}: {desc}]")
-            text = text.replace(f"[Record #{sid}: ]", f"[Record #{sid}: {desc}]")
+            fp = ""
+            if paths and sid in paths:
+                fp = f", file_path: {paths[sid]}"
+            text = text.replace(f"[Image #{sid}: ]", f"[Image #{sid}: {desc}{fp}]")
+            text = text.replace(f"[Record #{sid}: ]", f"[Record #{sid}: {desc}{fp}]")
         return text
 
-    def _fill_chain(self, chain, results: dict):
+    def _fill_chain(self, chain, results: dict, paths: Optional[dict] = None):
         if chain is None:
             return
         for elem in chain:
             if isinstance(elem, Text):
                 # 与 _fill_text 一致：全文 replace（不依赖 match 只匹配开头），
                 # 避免 Text 前有前缀时 chain 漏填而 message_str 已填的不一致
-                new_text = self._fill_text(elem.text or "", results)
+                new_text = self._fill_text(elem.text or "", results, paths)
                 if new_text != elem.text:
                     elem.text = new_text
             elif isinstance(elem, Reply):
-                self._fill_chain(getattr(elem, "chain", None), results)
+                self._fill_chain(getattr(elem, "chain", None), results, paths)
             elif isinstance(elem, Forward):
                 for sub in (getattr(elem, "chains", None) or []):
-                    self._fill_chain(sub, results)
+                    self._fill_chain(sub, results, paths)
 
     # ================= 缓存（复用 image_desc_cache 表） =================
 
