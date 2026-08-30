@@ -119,6 +119,12 @@ class DebouncePlugin(BasePlugin):
         self.sustain_count = defaultdict(int)
         self.sustain_tasks: dict[str, asyncio.Task] = {}
         self.sustain_judged = defaultdict(bool)
+        # 本轮终止标志：AI 空消息 / AI 停止词 / 用户停止词 / 达上限停窗后置位；
+        # LLM 请求兜底开窗据此不再重开窗口，直到下次真实唤醒（@/唤醒词/引用回复）解除
+        self.sustain_stopped: dict[str, bool] = {}
+        # 持续命中消息的 message_id 集合（按 sid）：用于区分「持续命中触发」与
+        # 「真实唤醒」，停窗时仅丢弃前者产生的积压批；新一轮唤醒时清空
+        self.sustain_hit_ids: dict[str, set] = {}
 
         # 私聊持续状态
         self.dm_sustain_until = defaultdict(float)
@@ -291,6 +297,8 @@ class DebouncePlugin(BasePlugin):
             allowed = True
         if not allowed:
             self._clear_sustain_state(sid)
+            self.sustain_stopped.pop(sid, None)
+            self.sustain_hit_ids.pop(sid, None)
         return allowed
 
     def _is_in_sustain_window(self, sid: str) -> bool:
@@ -338,6 +346,23 @@ class DebouncePlugin(BasePlugin):
     def _clear_sustain_state(self, sid: str):
         """完全清除群聊持续状态（含连续计数）。"""
         self._clear_sustain_window(sid, keep_count=False)
+
+    async def _stop_sustain_round(self, sid: str):
+        """明确终止本轮群聊持续对话（AI 空消息 / AI 停止词 / 用户停止词 / 达上限）。
+
+        除清除窗口与计数外：
+        - 置位 sustain_stopped：LLM 请求兜底开窗不再重开窗口，直到下次真实唤醒
+          （否则停窗后 count 归零，兜底开窗会以「连续次数 0」开启全新一轮，停止形同虚设）；
+        - 丢弃 QueueMerge pending 中「仅由持续命中消息触发」的积压批，
+          避免停窗前已命中的消息在停窗后仍被追加回复（真实唤醒的批次保留）。
+        sustain_hit_ids 不在此处清除：停窗后姗姗来迟的纯持续命中批次（debounce
+        尚未 flush）仍需凭它在批次入口拦截；由下次真实唤醒统一清空。
+        """
+        self._clear_sustain_state(sid)
+        self.sustain_stopped[sid] = True
+        dropped = await self.merge_scheduler.drop_sustain_pending(sid, self.sustain_hit_ids.get(sid))
+        if dropped:
+            logger.debug(f"[Sustain] 群 {sid} 停窗，丢弃持续命中积压批次 {dropped} 个")
 
     # ========== 私聊持续对话 ==========
     def _is_in_dm_sustain(self, sid: str) -> bool:
@@ -729,15 +754,18 @@ class DebouncePlugin(BasePlugin):
                 logger.debug(f"[Sustain] 群 {sid} 真实唤醒，重置连续计数（原 {self.sustain_count.get(sid, 0)}）")
             self.sustain_count[sid] = 0
             self._clear_sustain_window(sid, keep_count=True)
+            # 新一轮开始：解除终止标志，清空上一轮命中标记
+            self.sustain_stopped.pop(sid, None)
+            self.sustain_hit_ids.pop(sid, None)
 
         if self.sustain_enabled and event.is_group_message() and not event.is_mentioned and self._is_sustain_allowed(sid):
             if self._is_in_sustain_window(sid):
                 if self.max_sustain_replies != -1 and self.sustain_count[sid] >= self.max_sustain_replies:
-                    self._clear_sustain_state(sid)
+                    await self._stop_sustain_round(sid)
                 else:
                     text_content = "".join(elem.text for elem in event.message.chain if isinstance(elem, Text))
                     if self._check_stop_keywords(text_content, self.sustain_stop_keywords):
-                        self._clear_sustain_state(sid)
+                        await self._stop_sustain_round(sid)
                         event.discard()
                         return
 
@@ -748,6 +776,9 @@ class DebouncePlugin(BasePlugin):
                         if random.random() < self.sustain_reply_probability:
                             event.message.is_mentioned = True
                             self.sustain_count[sid] += 1
+                            _mid = getattr(event.message, "message_id", None)
+                            if _mid is not None:
+                                self.sustain_hit_ids.setdefault(sid, set()).add(_mid)
                             self._clear_sustain_window(sid, keep_count=True)
                             logger.debug(
                                 f"[Sustain] 群 {sid} 持续对话命中（per_message），连续次数 {self.sustain_count[sid]}"
@@ -768,6 +799,9 @@ class DebouncePlugin(BasePlugin):
                             if random.random() < self.sustain_reply_probability:
                                 event.message.is_mentioned = True
                                 self.sustain_count[sid] += 1
+                                _mid = getattr(event.message, "message_id", None)
+                                if _mid is not None:
+                                    self.sustain_hit_ids.setdefault(sid, set()).add(_mid)
                                 self._clear_sustain_window(sid, keep_count=True)
                                 logger.debug(
                                     f"[Sustain] 群 {sid} 持续对话命中（per_round），连续次数 {self.sustain_count[sid]}"
@@ -902,7 +936,13 @@ class DebouncePlugin(BasePlugin):
                 logger.debug(f"[Sustain] AI 回复包含停止关键词，停止窗口: {sid}")
 
             if should_stop:
-                self._clear_sustain_state(sid)
+                await self._stop_sustain_round(sid)
+                return
+
+            if self.sustain_stopped.get(sid):
+                # 本轮已在本批次处理期间被终止（如用户停止词/达上限），
+                # 在途回复不再重开窗口，等下次真实唤醒解除
+                logger.debug(f"[Sustain] 群 {sid} 本轮已终止，在途回复不开窗")
                 return
 
             if self.max_sustain_replies == -1 or self.sustain_count[sid] < self.max_sustain_replies:
@@ -979,6 +1019,10 @@ class DebouncePlugin(BasePlugin):
         sid = event.sid
         if not self._is_sustain_allowed(sid):
             return
+        if self.sustain_stopped.get(sid):
+            # 本轮已被明确终止（AI空消息/AI停止词/用户停止词/达上限），
+            # 兜底不再重开窗口，直到下次真实唤醒
+            return
         if self._is_in_sustain_window(sid):
             return
         if self.max_sustain_replies != -1 and self.sustain_count.get(sid, 0) >= self.max_sustain_replies:
@@ -990,6 +1034,16 @@ class DebouncePlugin(BasePlugin):
 
     @on.im_batch_message(priority=Priority.HIGH)
     async def on_queue_merge_batch(self, event: KiraMessageBatchEvent, *_):
+        # 停窗后迟到的「纯持续命中」批次直接拦截：其触发完全来自持续命中，
+        # 不应在 AI 已终止本轮后再引起一次回复（消息仍在缓冲，上下文不丢）
+        if event.is_group_message() and self.sustain_stopped.get(event.sid):
+            hit_ids = self.sustain_hit_ids.get(event.sid) or set()
+            mentioned = [m for m in (getattr(event, "messages", None) or [])
+                         if getattr(m, "is_mentioned", False)]
+            if mentioned and all(getattr(m, "message_id", None) in hit_ids for m in mentioned):
+                logger.debug(f"[Sustain] 群 {event.sid} 已停窗，拦截纯持续命中批次 {event.event_id}")
+                event.stop()
+                return
         await self.merge_scheduler.on_batch_message(event)
 
     @on.llm_response(priority=Priority.HIGH)
