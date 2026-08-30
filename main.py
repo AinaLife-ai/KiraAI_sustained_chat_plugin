@@ -16,6 +16,16 @@ _PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
 if _PLUGIN_DIR not in sys.path:
     sys.path.insert(0, _PLUGIN_DIR)
 
+# 热重载只重新 import main.py，sys.modules 里缓存的同目录模块不会更新；
+# 强制重载，避免改了 queue_merge / media_recognize 后热重载不生效（AttributeError 等）
+import importlib
+for _m in ("queue_merge", "media_recognize"):
+    if _m in sys.modules:
+        try:
+            importlib.reload(sys.modules[_m])
+        except Exception:
+            pass
+
 from core.plugin import BasePlugin, logger, on, Priority
 from core.chat.message_utils import KiraMessageEvent, KiraMessageBatchEvent
 from core.provider import LLMRequest, LLMResponse
