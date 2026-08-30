@@ -261,6 +261,41 @@ class BatchMergeScheduler:
         self._inflight_since[sid] = time.time()
         return merged
 
+    # ================= 持续对话停窗清理 =================
+
+    async def drop_sustain_pending(self, sid: str, hit_ids) -> int:
+        """丢弃 pending 中「仅由持续命中消息触发」的批次（持续对话停窗时调用）。
+
+        判定：批次内所有 mentioned 消息的 message_id 都在 hit_ids 中 → 该批次的
+        触发完全来自持续命中，丢弃；含真实唤醒消息（@/唤醒词/引用回复，mentioned
+        但不在 hit_ids）或不含任何 mentioned 消息的批次一律保留不动。
+        被丢弃批次的消息仍保留在会话缓冲中，仅少一次回复，上下文不丢。
+        只动 pending，不触碰 _inflight / _final_marked，不影响推送决策状态机。
+        返回丢弃批次数。
+        """
+        if not hit_ids:
+            return 0
+        async with self._lock:
+            pending = self._pending.get(sid)
+            if not pending:
+                return 0
+            kept: list[PendingBatch] = []
+            dropped = 0
+            for pb in pending:
+                msgs = getattr(pb.batch, "messages", None) or []
+                mentioned = [m for m in msgs if getattr(m, "is_mentioned", False)]
+                if mentioned and all(getattr(m, "message_id", None) in hit_ids for m in mentioned):
+                    dropped += 1
+                    self._log(sid, f"停窗丢弃持续命中积压批次 {pb.batch.event_id}（{len(msgs)} 条）")
+                else:
+                    kept.append(pb)
+            if dropped:
+                if kept:
+                    self._pending[sid] = kept
+                else:
+                    self._pending.pop(sid, None)
+            return dropped
+
     # ================= 阈值防护 =================
 
     def _split_by_limits(self, pending: list[PendingBatch]):

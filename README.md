@@ -1,4 +1,4 @@
-# KiraAI_sustained_chat_plugin/可持续聊天 2.3.2
+# KiraAI_sustained_chat_plugin/可持续聊天 2.3.3
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI_sustained_chat_plugin)
 
@@ -43,6 +43,7 @@ Shana: 牛肉面！听起来好香，我也想吃！
 - ✅ 支持停止关键词（用户/AI说“别聊了”即可终止）
 - ✅ 支持群聊作用域白名单/黑名单（`sustain_allowed_sessions` / `sustain_denied_sessions`），精准控制哪些群启用
 - ✅ **判定时机可配置**（`sustain_judge_timing`，默认 `either`）：LLM 处理期间与回复后两个时机都判定，也可只选其一或重叠时一轮只判一次
+- ✅ **停止即真停**：AI 空消息 / 停止词（或用户停止词、达上限）终止本轮后，LLM 请求兜底开窗不再重开窗口，停窗前已命中的积压消息也不再追加回复，直到下次真实唤醒（@/唤醒词/引用回复）
 
 > **为什么需要「判定时机」？**
 >
@@ -238,12 +239,24 @@ croniter>=1.3.0
 
 ## 📝 版本信息
 
-- 当前版本：v2.3.2
+- 当前版本：v2.3.3
 - 兼容 KiraAI：v2.29.6+（插件图标需 v2.30.0+）
 - 作者：KiraAI + znq19
 
 <details>
 <summary>更新日志</summary>
+
+### v2.3.3
+
+**修复持续对话停止后被「兜底开窗」复活**
+
+- **根因**：AI 输出空消息 / 命中停止词（或用户停止词、达上限）停窗时窗口与计数被清零，但两点让停止形同虚设：① 停窗前已命中（被标记为唤醒）的积压批次仍留在 QueueMerge pending 中，放行后照常触发一次 LLM 回复；② 该批次的 LLM 请求又触发兜底开窗（连续次数 0），开启全新一轮，连锁产生更多与停止意图相悖的回复
+- **修复**：
+  1. 新增「本轮已终止」标志：上述停止路径置位，LLM 请求兜底开窗检测到后不再开窗，直到下次真实唤醒（@/唤醒词/引用回复）解除
+  2. 持续命中时记录 message_id，用于区分「持续命中触发」与「真实唤醒」；停窗时丢弃 pending 中「仅由持续命中消息触发」的积压批（含真实唤醒消息的批次保留）；停窗后姗姗来迟的纯持续命中批次（debounce 尚未 flush）在批次入口直接拦截
+- 覆盖 both / either / llm_processing / after_reply 四种判定时机（after_reply 无兜底开窗问题，但共享积压批清理）；per_message / per_round 同时生效
+- 被丢弃批次的消息仍保留在会话缓冲中作为上下文，仅少一次回复，不丢上下文
+- 兼容说明：若某适配器消息无 `message_id` 字段，积压批清理自动退化为不生效（不报错、不影响其他逻辑）
 
 ### v2.3.2
 
