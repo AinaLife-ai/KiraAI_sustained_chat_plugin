@@ -1,4 +1,4 @@
-# KiraAI_sustained_chat_plugin/可持续聊天 2.3.3
+# KiraAI_sustained_chat_plugin/可持续聊天 2.3.4
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI_sustained_chat_plugin)
 
@@ -239,12 +239,20 @@ croniter>=1.3.0
 
 ## 📝 版本信息
 
-- 当前版本：v2.3.3
+- 当前版本：v2.3.4
 - 兼容 KiraAI：v2.29.6+（插件图标需 v2.30.0+）
 - 作者：KiraAI + znq19
 
 <details>
 <summary>更新日志</summary>
+
+### v2.3.4
+
+**修复热重载后子模块不更新（AttributeError）**
+
+- 框架热重载只重新 import `main.py`，`sys.modules` 中缓存的同目录子模块（`queue_merge` / `media_recognize`）不会更新，导致新版 main.py 调用子模块新增方法（如 `drop_sustain_pending`）时热重载后报 `AttributeError`
+- `main.py` 导入子模块前对已缓存模块执行 `importlib.reload`，热重载即可加载子模块最新代码；首次加载无行为变化，reload 失败静默忽略
+- 注意：从 ≤v2.3.3 升级本次仍需**完整重启一次**（清掉旧模块缓存），之后热重载即可正常生效
 
 ### v2.3.3
 
