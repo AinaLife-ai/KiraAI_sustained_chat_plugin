@@ -845,11 +845,16 @@ class DebouncePlugin(BasePlugin):
                 event.discard()
                 return
 
-        # 唤醒词检测
+        # 唤醒词检测（区分真 @ 与唤醒词命中：框架在循环前已标记真 @）
+        _was_mentioned = bool(getattr(event, "is_mentioned", False))
         for m in event.message.chain:
             if isinstance(m, Text) and any(w in m.text for w in self.waking_words):
                 event.message.is_mentioned = True
+                if not _was_mentioned:
+                    event._wake_source = "keyword"
                 break
+        if _was_mentioned:
+            event._wake_source = "at"
 
         if event.is_group_message():
             is_mentioned = event.is_mentioned
