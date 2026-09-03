@@ -1,4 +1,4 @@
-# KiraAI_sustained_chat_plugin/可持续聊天 2.3.4
+# KiraAI_sustained_chat_plugin/可持续聊天 2.4.0
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI_sustained_chat_plugin)
 
@@ -173,6 +173,104 @@ AI: 对了主人，我刚刚看到一个好笑的视频，想不想看？
 - ✅ 两个新模块均默认开启、可独立关闭，关闭后行为与旧版完全一致
 - ✅ **媒体识别填充 file_path**（v2.3.2）：识别后的图片标识符带本地文件路径（`[Image #id: 描述, file_path: data/temp/xxx.jpg]`），对齐原版 `message_format_to_text` 行为，LLM 可直接用路径做图生图/上传等操作
 
+### 8. 存在感节流 —— 回少提高、回多降低，永远得体
+
+**痛点**：bot 在群里太活跃会刷屏惹人烦，太安静又像消失。固定概率无法感知群里的“热闹程度”。
+
+**本插件**：实时统计最近 N 条消息里 bot 的发言占比，动态调节触发概率——**回少了提高、回多了降低**，让 bot 始终保持在目标占比附近。
+
+| 控制项 | 机制 |
+|--------|------|
+| **占比统计** | 取最近 `presence_window_size`（默认 20）条消息计算 bot 发言占比，可加时间衰减（`presence_decay_minutes`，默认 10 分钟） |
+| **调节系数 k_prob** | 占比高于 `presence_target_ratio`（默认 0.3）则降概率，低于则提概率；系数钳制在 `presence_k_min`（0.2）~ `presence_k_max`（2.0）之间 |
+| **闲时加分** | 静默时长高于该会话历史平均时加分（`idle_bonus_score`，默认 15），活跃群/死群标准不同 |
+| **评分补正** | `score_gate_enabled` 开启后：评分不足时概率命中作废（攒分），评分够时概率未命中补触发 |
+| **强制通路超额抑制** | `force_suppress` 开启后，bot 发言占比过高时，即使被唤醒也降级为评分门槛（分值到了才回） |
+
+```yaml
+# 一个典型场景
+群里很热闹，bot 已经连回了好几条 → 占比升高 → k_prob 调低 → 触发概率下降
+群里冷清，bot 很久没说话 → 占比降低 + 闲时加分 → k_prob 调高 → 更容易接话
+```
+
+- ✅ 所有主动触发（群聊持续对话、私聊主动、定时任务）都受存在感节流约束
+- ✅ 调节系数实时计算，无需重启，WebUI 改配置即生效
+
+---
+
+### 9. 骚扰感知化 —— bot 会“察觉”被骚扰，并主动屏蔽
+
+**痛点**：有人疯狂戳一戳、连续 @、刷关键词、反复引用唤醒，bot 只能被动回应，无法拒绝。
+
+**本插件**：检测到骚扰信号后，通过 **System 通知** 告知 bot，bot 用 **XML tag** 自主决策是否屏蔽、屏蔽谁、屏蔽多久。
+
+| 信号 | 检测方式 | 决策 tag |
+|------|----------|----------|
+| **戳一戳** | 时间窗内被戳次数达阈值 | `<poke_ignore>` |
+| **连续 at** | 时间窗内被 @ 次数达阈值 | `<at_ignore>` |
+| **连续关键词** | 时间窗内命中唤醒词次数达阈值 | `<kw_ignore>` |
+| **引用唤醒** | 时间窗内被引用回复次数达阈值 | `<reply_ignore>` |
+
+**XML tag 语法**（值 `user|duration:N` / `all|duration:N` / `none`）：
+
+```xml
+<poke_ignore>user|duration:180</poke_ignore>   <!-- 屏蔽某用户戳一戳 180 秒 -->
+<at_ignore>all|duration:300</at_ignore>        <!-- 屏蔽所有人 at 300 秒 -->
+<kw_ignore>none</kw_ignore>                    <!-- 不屏蔽 -->
+```
+
+- ✅ 默认屏蔽 180 秒（`default_duration`），bot 可自设时长（`allow_bot_duration`），钳制到最大 300 秒（`max_duration`）
+- ✅ 各信号独立开关、独立窗口/阈值/累计范围（`per_user` 按单用户 / `all` 按会话）
+- ✅ **manage_ignore 工具**：bot 可主动调用 `block` / `unblock` / `list` 管理屏蔽名单
+- ✅ 屏蔽名单持久化，重启不丢
+
+---
+
+### 10. 休眠时段 —— bot 也会“睡觉”，起夜有概率
+
+**痛点**：深夜群里没人，bot 却还在定时任务/持续对话里冒泡，显得很“假”。
+
+**本插件**：配置休眠时段后，休眠期内 bot 不主动触发；被提及（@/唤醒词/戳一戳）时按**起夜概率**决定是否推送给 LLM。
+
+| 控制项 | 机制 |
+|--------|------|
+| **休眠时段** | `dormant_ranges` 列表，格式 `HH:MM-HH:MM`，`start>end` 表示跨午夜（如 `23:00-08:00`）；默认空 = 全天活跃 |
+| **起夜概率** | `dormant_wake_probability`（默认 0.3），休眠期内被提及推送给 LLM 的概率 |
+| **维持模式** | `wake_keep_mode`：`renew`（续窗型，LLM 最后回复完再没人找才计时）/ `once`（一次性型，唤醒后计时到点结束） |
+| **维持时长** | `wake_keep_seconds`（默认 300 秒），唤醒后保持可聊的时长 |
+| **互动上限** | `wake_max_rounds`（默认 -1 不限），唤醒后最大互动次数 |
+| **主动续窗** | `wake_max_extensions`（默认 -1 无限），bot 主动续窗次数上限（0 不能续） |
+
+```yaml
+# 一个典型场景
+休眠时段: 23:00-08:00
+深夜 1 点有人 @bot → 按起夜概率 30% 决定是否回应
+回应后进入维持期（renew 模式，300 秒）→ 期间可正常聊
+维持期结束 → 回到休眠，不再主动冒泡
+```
+
+- ✅ 休眠期内所有主动触发（持续对话、私聊主动、定时任务）全部静默
+- ✅ 起夜概率、维持模式、续窗限制均可配，bot 不会在深夜刷屏
+
+---
+
+### 11. 通知合并 —— 骚扰通知不刷屏，一次 LLM 调用全处理
+
+**痛点**：多个骚扰信号同时触发时，若每个都单独通知，会瞬间刷屏。
+
+**本插件**：per-session 挂起队列，通知先进队列，`on_llm_request` 时**统一注入**（一次 LLM 调用处理所有通知）；bot 休眠中长时间无请求时，短窗口（默认跟随 `max_message_interval`）兜底统一 publish。
+
+- ✅ 同一会话的多个通知合并为一条，不刷屏
+- ✅ 有 LLM 请求时随请求注入，无请求时短窗口兜底，通知不丢失
+
+---
+
+### 12. queue_merge 升级为 z 版 + 补回 drop_sustain_pending
+
+**自拦截防护双保险**：合并/重放批次打 `_qm_self` 自发布标记，`on_batch_message` 识别后无条件放行；推送决策用 `done_event_id` 双保险，锁内确认 in-flight 才执行——对一切竞态路径（tick、shutdown 重发、重复广播）免疫自拦截。
+
+**补回 `drop_sustain_pending`**：持续对话停止时，丢弃 pending 中「仅由持续命中消息触发」的积压批，避免停止后仍被积压消息复活。
+
 ---
 
 ## 🎛️ 配置概览
@@ -186,6 +284,9 @@ AI: 对了主人，我刚刚看到一个好笑的视频，想不想看？
 | `section_scheduled` | 定时主动任务（间隔/Cron、会话列表、工具黑名单、提示词） |
 | `section_queue_merge` | 队列合并/积压处理（积压批次合并推送，更省 token） |
 | `section_media_recognition` | 并行媒体识别（图片 VLM + 语音 STT 并行预处理，回复更快） |
+| `section_presence` | 存在感节流（bot 发言占比 → k_prob 调节系数，回少提高/回多降低） |
+| `section_poke` / `section_at` / `section_keyword` / `section_reply` | 骚扰感知化（戳/at/关键词/引用检测 + XML 决策屏蔽） |
+| `section_dormant` | 休眠时段（起夜概率 + 维持期 + 主动续窗限制） |
 
 ---
 
@@ -239,12 +340,36 @@ croniter>=1.3.0
 
 ## 📝 版本信息
 
-- 当前版本：v2.3.4
+- 当前版本：v2.4.0
 - 兼容 KiraAI：v2.29.6+（插件图标需 v2.30.0+）
 - 作者：KiraAI + znq19
 
 <details>
 <summary>更新日志</summary>
+
+### v2.4.0
+
+**存在感节流（`section_presence`）**
+- 统计最近 N 条消息的 bot 发言占比，动态调节触发概率：回少提高、回多降低（k_prob 调节系数，钳制在 `presence_k_min`~`presence_k_max`）
+- 评分补正（`score_gate_enabled`）：评分不足时概率命中作废（攒分），评分够时概率未命中补触发
+- 闲时加分（`idle_bonus_score`）：静默时长高于会话历史平均时加分
+- 强制通路超额抑制（`force_suppress`）：bot 发言占比过高时，被唤醒也降级为评分门槛
+
+**骚扰感知化（`section_poke` / `section_at` / `section_keyword` / `section_reply`）**
+- 戳一戳 / 连续 at / 连续关键词 / 引用唤醒 频率检测 → System 通知 → bot 用 XML tag 决策屏蔽
+- tag：`<poke_ignore>` / `<at_ignore>` / `<kw_ignore>` / `<reply_ignore>`，值 `user|duration:N` / `all|duration:N` / `none`
+- 默认屏蔽 180s，bot 可自设时长钳制到 300s；`manage_ignore` 工具可主动管理（block/unblock/list）
+
+**休眠时段（`section_dormant`）**
+- `dormant_ranges` 休眠时段 list，默认空 = 全天活跃；起夜概率 `dormant_wake_probability`
+- 维持期 `wake_keep_mode`（renew/once）+ `wake_keep_seconds` + `wake_max_rounds` + `wake_max_extensions` 主动续窗限制
+
+**通知合并**
+- per-session 挂起队列，`on_llm_request` 统一注入，短窗口兜底跟随 `max_message_interval`
+
+**queue_merge 升级为 z 版**
+- `_qm_self` 自发布标记 + `done_event_id` 双保险，对竞态路径免疫自拦截
+- 补回 `drop_sustain_pending`：持续对话停止时丢弃仅由持续命中消息触发的积压批
 
 ### v2.3.4
 

@@ -13,7 +13,10 @@
     执行完 agent 即结束（无最终文本收尾），提前标记让 tick/ON_STEP_RESULT 立即推送
     pending，避免等「in-flight 卡死兜底」（LLM 超时 + 工具超时，默认 180s）的长哑巴
     ON_STEP_RESULT（消息发送后触发）同 event_id 且已标记 -> 执行推送决策
-- 自拦截防护：自己推送的（合并/重放）批次在 on_batch_message 直接放行，防死循环
+- 自拦截防护：合并/重放批次打 _qm_self 自发布标记，on_batch_message 识别后无条件放行
+  （不依赖 in-flight 匹配，对竞态/重复事件/重放路径免疫，防死循环）
+- 推送决策双保险：on_step_result 传入 done_event_id，_push_pending 锁内确认 in-flight
+  仍是本次完成事件才执行（hook 重复注册/事件重复广播时跳过，不误清 in-flight）
 - 积压媒体限制（media_preprocess_enabled + media_preprocess_max_batches）：
     含媒体批次在 pending 已满上限时直接放行独立处理，避免媒体无限积压 + VLM/STT 重复预处理
 - 调试日志开关（debug_log_enabled）：开启后打印放行/拦截/三分支/拆批等状态，便于排查
@@ -128,16 +131,17 @@ class BatchMergeScheduler:
             return
         sid = event.session.sid
         async with self._lock:
-            if self._inflight.get(sid) == event.event_id:
-                # 自己推送的（合并/重放）批次：in-flight 就是它自己，直接放行，
-                # 防止"推送 -> 到达 -> 拦截自己 -> 超时再推 -> 再拦截"的死循环
-                return
+            # 自己推送的（合并/重放）批次：_qm_self 自发布标记直接放行（双保险，
+            # 不依赖 in-flight 匹配——异步窗口/重复事件下 in-flight 可能已被误清）。
+            # 同时恢复 in-flight 跟踪，确保收尾事件能触发下一轮推送决策。
+            # 外部批次（core trigger/flush 创建）extra 默认 None，判空后再取标记（与 S 版对齐）
             if event.extra and event.extra.get("_qm_self"):
-                # 自发布批次兜底：即使 _inflight 被并发路径误清（见 _push_pending 注释），
-                # 带自发布标记的批次也绝对放行，并恢复 inflight 跟踪，防状态悬空
-                if self._inflight.get(sid) != event.event_id:
-                    self._inflight[sid] = event.event_id
-                    self._inflight_since[sid] = time.time()
+                self._inflight[sid] = event.event_id
+                self._inflight_since[sid] = time.time()
+                self._log(sid, f"自发布批次 {event.event_id} 直接放行（_qm_self）")
+                return
+            if self._inflight.get(sid) == event.event_id:
+                # 兼容旧路径：in-flight 匹配也放行（无 _qm_self 标记的历史批次）
                 return
             if sid in self._inflight or self._pending.get(sid):
                 # 积压媒体限制：pending 中已积压的含媒体批次达到上限时，
@@ -178,12 +182,19 @@ class BatchMergeScheduler:
                     self._log(sid, f"批次 {event.event_id} 最后一步仍带工具，提前标记收尾")
 
     async def on_step_result(self, event: KiraMessageBatchEvent, *_):
-        """ON_STEP_RESULT：最后一步消息已发送完（事实 #9）-> 执行推送决策（0 延迟）。"""
+        """ON_STEP_RESULT：最后一步消息已发送完（事实 #9）-> 执行推送决策（0 延迟）。
+
+        ⚠️ done_event_id 校验：KiraAI EventBus.publish 只是异步入队，hook 分发在
+        dispatch() 消费循环异步执行；hook 重复注册（热重载累积）时 ON_STEP_RESULT 会
+        对同一 event 广播多次。无校验时第二次调用会无条件清 _inflight，导致刚发布的
+        合并批次到达 on_batch_message 时匹配不上、被误判为外部批次拦截进 pending，
+        与 ContextCondensation 等阻塞型插件共存时稳定复现队列死锁。"""
         if not self.enabled:
             return
         sid = event.session.sid
         need_push = False
         async with self._lock:
+            # 锁内只判定；真正的二次校验在 _push_pending 锁内再做（双保险）
             if self._inflight.get(sid) == event.event_id and sid in self._final_marked:
                 need_push = True
         if need_push:
@@ -205,18 +216,15 @@ class BatchMergeScheduler:
 
     # ================= 推送决策（三分支，串行） =================
 
-    async def _push_pending(self, sid: str, done_event_id: Optional[str] = None):
+    async def _push_pending(self, sid: str, done_event_id: str):
         """锁内决策 + 状态更新，锁外 publish。
 
-        done_event_id：触发本次推送的完成批次 event_id（ON_STEP_RESULT 的事件）。
-        锁内先校验 _inflight[sid] 仍是该批次才执行——防止并发/重复事件（ON_STEP_RESULT
-        重复广播、hook 重复注册、tick 竞争等）在「发布合并批次 → 该批次到达
-        on_batch_message」的异步窗口内误清 _inflight，导致自己发布的批次被自己
-        拦截进 pending（会话队列死锁根因）。校验失败直接 return，不动任何状态。
-        """
+        ⚠️ done_event_id 双保险：_decide_and_apply_locked 会无条件清 _inflight，
+        只有 in-flight 仍是本次完成事件时才允许执行；重复/过期广播直接跳过，不误清状态。"""
         to_publish = None
         async with self._lock:
-            if done_event_id is not None and self._inflight.get(sid) != done_event_id:
+            if self._inflight.get(sid) != done_event_id:
+                self._log(sid, f"忽略过期完成事件 {done_event_id}（in-flight={self._inflight.get(sid)}）")
                 return
             to_publish = self._decide_and_apply_locked(sid)
         if to_publish is not None:
@@ -260,8 +268,6 @@ class BatchMergeScheduler:
         self._inflight[sid] = merged.event_id
         self._inflight_since[sid] = time.time()
         return merged
-
-    # ================= 持续对话停窗清理 =================
 
     async def drop_sustain_pending(self, sid: str, hit_ids) -> int:
         """丢弃 pending 中「仅由持续命中消息触发」的批次（持续对话停窗时调用）。
@@ -374,9 +380,8 @@ class BatchMergeScheduler:
             adapter=last.adapter,
             session=last.session,
             messages=msgs,
-            # _qm_self：自发布标记，on_batch_message 凭此兜底放行自己发布的批次
-            #（详见 on_batch_message / _push_pending 注释），防异步窗口竞态自拦截
-            extra={"merged_from": [b.batch.event_id for b in batches], "_qm_self": True},
+            extra={"merged_from": [b.batch.event_id for b in batches],
+                   "_qm_self": True},  # 自发布标记：on_batch_message 识别后无条件放行
         )
         return merged
 
