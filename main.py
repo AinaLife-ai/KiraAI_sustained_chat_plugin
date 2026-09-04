@@ -179,13 +179,15 @@ class DebouncePlugin(BasePlugin):
         for _k in ("dormant_scope_sessions", "dormant_whitelist_users", "dormant_whitelist_sessions"):
             if _k in _dscope:
                 _enhance_cfg[_k] = _dscope[_k]
-        # 评分补正独立开关（群聊持续对话 / 私聊持续对话）
+        # 评分补正独立开关（门槛过滤 deny / 补偿触发 boost，三个通路各自独立）
         _gscope = cfg.get("section_group_sustain", {}) or {}
-        if "sustain_score_gate_enabled" in _gscope:
-            _enhance_cfg["sustain_score_gate_enabled"] = _gscope["sustain_score_gate_enabled"]
+        for _k in ("sustain_score_gate_deny", "sustain_score_gate_boost"):
+            if _k in _gscope:
+                _enhance_cfg[_k] = _gscope[_k]
         _dmscope = cfg.get("section_dm_sustain", {}) or {}
-        if "dm_sustain_score_gate_enabled" in _dmscope:
-            _enhance_cfg["dm_sustain_score_gate_enabled"] = _dmscope["dm_sustain_score_gate_enabled"]
+        for _k in ("dm_sustain_score_gate_deny", "dm_sustain_score_gate_boost"):
+            if _k in _dmscope:
+                _enhance_cfg[_k] = _dmscope[_k]
         self.enhance = ChatEnhanceEngine(ctx, _enhance_cfg, self, merge_seconds=self.debounce_interval)
 
     async def initialize(self):
@@ -638,7 +640,7 @@ class DebouncePlugin(BasePlugin):
         # 存在感节流：概率 × k_prob（回少提高/回多降低）+ 评分补正
         _dm_prob = self.dm_sustain_reply_probability * self.enhance.k_prob(sid)
         _dm_hit = rand_val < _dm_prob
-        if self.enhance.score_gate(sid, _dm_hit, scope="dm_sustain", prob=_dm_prob):
+        if self.enhance.score_gate(sid, _dm_hit, scope="dm_sustain"):
             self.dm_sustain_count[sid] += 1
             count = self.dm_sustain_count[sid]
             # 成功发送后重置重试计数（保留主动次数）
@@ -998,7 +1000,7 @@ class DebouncePlugin(BasePlugin):
                         else:
                             _sustain_prob = self.sustain_reply_probability * self.enhance.k_prob(sid)
                             _sustain_hit = random.random() < _sustain_prob
-                            if self.enhance.score_gate(sid, _sustain_hit, scope="sustain", prob=_sustain_prob):
+                            if self.enhance.score_gate(sid, _sustain_hit, scope="sustain"):
                                 event.message.is_mentioned = True
                                 self.sustain_count[sid] += 1
                                 _mid = getattr(event.message, "message_id", None)
@@ -1028,7 +1030,7 @@ class DebouncePlugin(BasePlugin):
                                 # 存在感节流：概率 × k_prob + 评分补正
                                 _sustain_prob = self.sustain_reply_probability * self.enhance.k_prob(sid)
                                 _sustain_hit = random.random() < _sustain_prob
-                                if self.enhance.score_gate(sid, _sustain_hit, scope="sustain", prob=_sustain_prob):
+                                if self.enhance.score_gate(sid, _sustain_hit, scope="sustain"):
                                     event.message.is_mentioned = True
                                     self.sustain_count[sid] += 1
                                     _mid = getattr(event.message, "message_id", None)
@@ -1063,7 +1065,7 @@ class DebouncePlugin(BasePlugin):
                     prob = self.group_proactive_chat_probability * self.enhance.k_prob(sid)
                     prob_hit = random.random() < prob
                     # 评分补正：评分不足概率命中作废；评分够概率未命中补触发
-                    if self.enhance.score_gate(sid, prob_hit, prob=prob):
+                    if self.enhance.score_gate(sid, prob_hit):
                         logger.info("[Chat] Triggered proactive chat")
                         event.flush()
             else:
