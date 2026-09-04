@@ -50,6 +50,15 @@ class BatchMergeScheduler:
         sec = plugin_cfg.get("section_queue_merge", {})
         self.enabled = sec.get("enabled", True)
         self.max_merge_seconds = float(sec.get("max_merge_seconds", 0))
+        # 合并窗口顺延（防抖重置）：最后一条消息到达后 N 秒无新消息 → 合并推送；
+        # 期间新消息到达 → 窗口重置再等 N 秒（把突发合并完再 flush）。
+        # 0/空 = 自动：取框架"最大消息合并间隔"（bot_config.bot.max_message_interval，
+        # WebUI 显示为 Message Merge Interval，默认 2s）；填值则按该值。
+        merge_window_cfg = sec.get("merge_window_seconds", 0)
+        if merge_window_cfg and float(merge_window_cfg) > 0:
+            self.merge_window_seconds = float(merge_window_cfg)
+        else:
+            self.merge_window_seconds = float(bot_cfg.get("max_message_interval", 1.5))
         self.max_merge_batches_limit = int(sec.get("max_merge_batches_limit", 0))
         self.max_merge_messages = int(sec.get("max_merge_messages", -1))
         self.max_merge_est_tokens = int(sec.get("max_merge_est_tokens", 0))
@@ -113,6 +122,7 @@ class BatchMergeScheduler:
         self._inflight_since: dict[str, float] = {}  # sid -> 最近一次 LLM 活动时间（卡死兜底用）
         self._final_marked: set[str] = set()         # 该 sid 的 in-flight 批次已进入最后一步
         self._pending: dict[str, list[PendingBatch]] = {}   # sid -> 待推送队列
+        self._last_arrival: dict[str, float] = {}    # sid -> 最后一条消息到达时间（防抖窗口用）
         self._lock = asyncio.Lock()
         self._merge_task: Optional[asyncio.Task] = None
 
@@ -153,6 +163,7 @@ class BatchMergeScheduler:
                     return
                 # 已有批次处理中 / 已有积压 -> 拦截进 pending
                 self._pending.setdefault(sid, []).append(PendingBatch(time.time(), event))
+                self._last_arrival[sid] = time.time()  # 防抖窗口重置
                 event.stop()
                 pend_n = len(self._pending[sid])
                 self._log(sid, f"拦截批次 {event.event_id} 进 pending（pending={pend_n}）")
@@ -220,12 +231,26 @@ class BatchMergeScheduler:
         """锁内决策 + 状态更新，锁外 publish。
 
         ⚠️ done_event_id 双保险：_decide_and_apply_locked 会无条件清 _inflight，
-        只有 in-flight 仍是本次完成事件时才允许执行；重复/过期广播直接跳过，不误清状态。"""
+        只有 in-flight 仍是本次完成事件时才允许执行；重复/过期广播直接跳过，不误清状态。
+
+        防抖窗口：in-flight 完成时若 pending 非空，先等 merge_window_seconds
+        （期间新消息到达会重置窗口），窗口静默后才推送——把突发合并完再 flush。
+        """
         to_publish = None
         async with self._lock:
             if self._inflight.get(sid) != done_event_id:
                 self._log(sid, f"忽略过期完成事件 {done_event_id}（in-flight={self._inflight.get(sid)}）")
                 return
+            if self._pending.get(sid):
+                # 防抖：等窗口静默（期间新消息重置 _last_arrival）
+                while True:
+                    last = self._last_arrival.get(sid, 0.0)
+                    wait = self.merge_window_seconds - (time.time() - last)
+                    if wait <= 0:
+                        break
+                    self._log(sid, f"防抖等待 {wait:.1f}s（窗口 {self.merge_window_seconds}s）")
+                    await asyncio.sleep(wait)
+                    # 等待期间新消息到达会更新 _last_arrival，循环重新计算
             to_publish = self._decide_and_apply_locked(sid)
         if to_publish is not None:
             n_msgs = len(to_publish.messages)
@@ -238,6 +263,7 @@ class BatchMergeScheduler:
         self._inflight.pop(sid, None)
         self._inflight_since.pop(sid, None)
         self._final_marked.discard(sid)
+        self._last_arrival.pop(sid, None)
         if not pending:
             return None
 
@@ -262,8 +288,9 @@ class BatchMergeScheduler:
 
         if rest:
             self._log(sid, f"拆批/留存：本次合 {len(to_merge)} 批次，{len(rest)} 批次留待下轮")
-
-        self._pending[sid] = rest
+            self._pending[sid] = rest
+        else:
+            self._pending.pop(sid, None)
         merged = self._build_merged_batch(to_merge)
         self._inflight[sid] = merged.event_id
         self._inflight_since[sid] = time.time()

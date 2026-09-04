@@ -109,6 +109,8 @@ class DebouncePlugin(BasePlugin):
         # 新增：控制停止词是否触发重试
         self.dm_retry_on_user_stop = dm_sustain.get("dm_retry_on_user_stop", True)
         self.dm_retry_on_ai_stop = dm_sustain.get("dm_retry_on_ai_stop", True)
+        # 空 msg 后评分补上再触发（默认关）：bot 空 msg 只是"这次不回"，不是"这轮结束"
+        self.dm_retry_on_empty = bool(dm_sustain.get("dm_retry_on_empty", False))
 
         # ========== 从 section_scheduled 读取定时任务配置 ==========
         scheduled = cfg.get("section_scheduled", {})
@@ -1154,7 +1156,12 @@ class DebouncePlugin(BasePlugin):
                         stop_reason = "AI停止关键词"
 
                     if should_stop:
-                        if self.dm_sustain_mode == "per_retry" and self.dm_retry_on_ai_stop:
+                        if stop_reason == "空消息" and self.dm_retry_on_empty:
+                            # 空 msg 只是"这次不回"：重新开窗，评分补上时再给一次触发机会
+                            # （不结束本轮，不重置主动次数）
+                            self._start_dm_sustain_window(sid)
+                            logger.debug(f"[DM Sustain] 私聊 {sid} AI 空消息（dm_retry_on_empty），重开窗口等评分补上")
+                        elif self.dm_sustain_mode == "per_retry" and self.dm_retry_on_ai_stop:
                             # 视为失败，重试或取消（不重置主动次数）
                             self._handle_dm_failure(sid, f"AI {stop_reason}")
                         else:

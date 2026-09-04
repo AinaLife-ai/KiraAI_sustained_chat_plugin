@@ -347,6 +347,12 @@
         "name": "私聊持续对话评分补正",
         "default": false,
         "hint": "仅对私聊持续对话概率生效的评分补正开关（独立于全局评分补正），默认关闭"
+      },
+      "dm_retry_on_empty": {
+        "type": "switch",
+        "name": "空消息评分补触发（私聊）",
+        "default": false,
+        "hint": "AI 输出空消息时重新开窗，评分补上时再给一次主动触发机会（默认关=空消息结束本轮）"
       }
     }
   },
@@ -511,6 +517,12 @@
         "type": "switch",
         "default": false,
         "hint": "开启后打印队列合并调试日志（放行/拦截/软合并/超时合并/拆批等决策），便于排查"
+      },
+      "merge_window_seconds": {
+        "type": "float",
+        "name": "合并窗口顺延（秒）",
+        "default": 0,
+        "hint": "最后一条消息到达后 N 秒无新消息才合并推送（防抖重置：期间新消息到达窗口重置）。0=自动：取框架最大消息合并间隔（bot_config.bot.max_message_interval，默认 2s）"
       }
     }
   },
