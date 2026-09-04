@@ -211,11 +211,17 @@
         "default": false,
         "hint": "开启后 bot 输出空消息只是这次不回，窗口保留，评分补上时再给一次触发机会（默认关）"
       },
-      "sustain_score_gate_enabled": {
+      "sustain_score_gate_deny": {
+        "name": "门槛过滤",
         "type": "switch",
-        "name": "群聊持续对话评分补正",
         "default": false,
-        "hint": "仅对群聊持续对话概率生效的评分补正开关（独立于全局评分补正），默认关闭"
+        "hint": "群聊持续对话：概率命中但累计分不足时阻止触发"
+      },
+      "sustain_score_gate_boost": {
+        "name": "补偿触发",
+        "type": "switch",
+        "default": false,
+        "hint": "群聊持续对话：概率未命中但累计分达标时强制触发并清零"
       }
     }
   },
@@ -342,17 +348,23 @@
         "default": "partial",
         "hint": "partial: 工具名包含关键词即禁用；exact: 完全匹配才禁用"
       },
-      "dm_sustain_score_gate_enabled": {
-        "type": "switch",
-        "name": "私聊持续对话评分补正",
-        "default": false,
-        "hint": "仅对私聊持续对话概率生效的评分补正开关（独立于全局评分补正），默认关闭"
-      },
       "dm_retry_on_empty": {
         "type": "switch",
         "name": "空消息评分补触发（私聊）",
         "default": false,
         "hint": "AI 输出空消息时重新开窗，评分补上时再给一次主动触发机会（默认关=空消息结束本轮）"
+      },
+      "dm_sustain_score_gate_deny": {
+        "name": "门槛过滤",
+        "type": "switch",
+        "default": false,
+        "hint": "私聊持续对话：概率命中但累计分不足时阻止触发"
+      },
+      "dm_sustain_score_gate_boost": {
+        "name": "补偿触发",
+        "type": "switch",
+        "default": false,
+        "hint": "私聊持续对话：概率未命中但累计分达标时强制触发并清零"
       }
     }
   },
@@ -659,12 +671,6 @@
         "default": false,
         "hint": "开启后 bot 发言占比过高时，被唤醒也降级为评分门槛（分值到了才回）"
       },
-      "score_gate_enabled": {
-        "type": "switch",
-        "name": "评分补正",
-        "default": false,
-        "hint": "开启后概率触发受评分补正：评分不足概率命中作废（攒分），评分够概率未命中补触发"
-      },
       "score_threshold": {
         "type": "float",
         "name": "评分阈值",
@@ -694,6 +700,18 @@
         "type": "float",
         "default": 1.5,
         "hint": "相对判定：静默时长超过该会话历史平均静默 × 倍数才算闲时（冷场）。活跃群/死群标准不同。0=不判闲时（闲时加分关闭）"
+      },
+      "score_gate_deny": {
+        "name": "门槛过滤（评分不足时阻止概率命中）",
+        "type": "switch",
+        "default": false,
+        "hint": "概率命中后累计分不足阈值则阻止触发，分数保留继续攒"
+      },
+      "score_gate_boost": {
+        "name": "补偿触发（评分达标时强制补发）",
+        "type": "switch",
+        "default": false,
+        "hint": "概率未命中但累计分达阈值则强制补偿触发，触发后清零"
       }
     }
   },
