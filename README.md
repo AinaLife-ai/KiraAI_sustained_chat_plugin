@@ -184,7 +184,7 @@ AI: 对了主人，我刚刚看到一个好笑的视频，想不想看？
 | **占比统计** | 取最近 `presence_window_size`（默认 20）条消息计算 bot 发言占比，可加时间衰减（`presence_decay_minutes`，默认 10 分钟） |
 | **调节系数 k_prob** | 占比高于 `presence_target_ratio`（默认 0.3）则降概率，低于则提概率；系数钳制在 `presence_k_min`（0.2）~ `presence_k_max`（2.0）之间 |
 | **闲时加分** | 静默时长高于该会话历史平均时加分（`idle_bonus_score`，默认 15），活跃群/死群标准不同 |
-| **评分补正** | `score_gate_enabled` 开启后：评分不足时概率命中作废（攒分），评分够时概率未命中补触发 |
+| **评分补正** | 拆为两个独立模式：`score_gate_deny`（门槛过滤：评分不足时阻止概率命中，分继续攒）+ `score_gate_boost`（补偿触发：评分达标时强制补发，触发后清零）。三条通路各自独立控制（section_presence / section_group_sustain / section_dm_sustain） |
 | **强制通路超额抑制** | `force_suppress` 开启后，bot 发言占比过高时，即使被唤醒也降级为评分门槛（分值到了才回） |
 
 ```yaml
@@ -362,7 +362,7 @@ croniter>=1.3.0
 
 **存在感节流（`section_presence`）**
 - 统计最近 N 条消息的 bot 发言占比，动态调节触发概率：回少提高、回多降低（k_prob 调节系数，钳制在 `presence_k_min`~`presence_k_max`）
-- 评分补正（`score_gate_enabled`）：评分不足时概率命中作废（攒分），评分够时概率未命中补触发
+- 评分补正（`score_gate_deny` + `score_gate_boost`）：门槛过滤与补偿触发独立控制，三条通路各自独立（section_presence / section_group_sustain / section_dm_sustain）
 - 闲时加分（`idle_bonus_score`）：静默时长高于会话历史平均时加分
 - 强制通路超额抑制（`force_suppress`）：bot 发言占比过高时，被唤醒也降级为评分门槛
 
