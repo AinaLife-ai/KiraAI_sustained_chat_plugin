@@ -53,6 +53,9 @@ class DebouncePlugin(BasePlugin):
         self.group_chat_prompt = basic.get("group_chat_prompt", "")
         self.group_proactive_chat = basic.get("group_proactive_chat", False)
         self.group_proactive_chat_probability = float(basic.get("group_proactive_chat_probability", 0.1))
+        self.proactive_scope_sessions = set(
+            str(x) for x in (basic.get("proactive_scope_sessions") or [])
+        )
 
         # ========== 从 section_media 读取媒体处理配置 ==========
         media = cfg.get("section_media", {})
@@ -162,6 +165,15 @@ class DebouncePlugin(BasePlugin):
             _sec_cfg = cfg.get(_sec, {}) or {}
             for _k, _v in _sec_cfg.items():
                 _enhance_cfg[_k] = _v
+        # 防骚扰/休眠作用域与白名单（section_harass_scope / section_dormant 内）
+        _hscope = cfg.get("section_harass_scope", {}) or {}
+        for _k in ("harass_scope_sessions", "harass_whitelist_users", "harass_whitelist_sessions"):
+            if _k in _hscope:
+                _enhance_cfg[_k] = _hscope[_k]
+        _dscope = cfg.get("section_dormant", {}) or {}
+        for _k in ("dormant_scope_sessions", "dormant_whitelist_users", "dormant_whitelist_sessions"):
+            if _k in _dscope:
+                _enhance_cfg[_k] = _dscope[_k]
         self.enhance = ChatEnhanceEngine(ctx, _enhance_cfg, self, merge_seconds=self.debounce_interval)
 
     async def initialize(self):
@@ -426,6 +438,12 @@ class DebouncePlugin(BasePlugin):
         return False
 
     # ========== 群聊持续对话 ==========
+    def _is_proactive_allowed(self, sid: str) -> bool:
+        """群聊积极概率作用域检查：scope 非空时仅这些会话生效（空=全部）。"""
+        if not self.proactive_scope_sessions:
+            return True
+        return sid in self.proactive_scope_sessions
+
     def _is_sustain_allowed(self, sid: str) -> bool:
         """群聊持续对话作用域检查：白名单非空时仅白名单内生效；白名单为空时排除黑名单。
 
@@ -597,7 +615,7 @@ class DebouncePlugin(BasePlugin):
 
         rand_val = random.random()
         # 休眠期内不主动触发（休眠时段不主动）
-        if self.enhance.dormant.in_dormant(self.enhance._now_hhmm()):
+        if self.enhance.dormant.in_dormant(self.enhance._now_hhmm(), sid):
             logger.debug(f"[DM Sustain] 休眠期内不主动触发: {sid}")
             self._handle_dm_failure(sid, "休眠时段")
             return
@@ -950,7 +968,7 @@ class DebouncePlugin(BasePlugin):
                         # 命中：回复并关窗（保留计数），等 AI 回复后再开新窗
                         # 存在感节流：概率 × k_prob（回少提高/回多降低）+ 评分补正
                         # 休眠期内不介入（休眠时段不主动触发）
-                        if self.enhance.dormant.in_dormant(self.enhance._now_hhmm()):
+                        if self.enhance.dormant.in_dormant(self.enhance._now_hhmm(), sid):
                             logger.debug(f"[Sustain] 群 {sid} 休眠期内不介入（per_message）")
                         else:
                             _sustain_prob = self.sustain_reply_probability * self.enhance.k_prob(sid)
@@ -979,7 +997,7 @@ class DebouncePlugin(BasePlugin):
                         if not self.sustain_judged.get(sid, False):
                             self.sustain_judged[sid] = True
                             # 休眠期内不介入（休眠时段不主动触发）
-                            if self.enhance.dormant.in_dormant(self.enhance._now_hhmm()):
+                            if self.enhance.dormant.in_dormant(self.enhance._now_hhmm(), sid):
                                 logger.debug(f"[Sustain] 群 {sid} 休眠期内不介入（per_round）")
                             else:
                                 # 存在感节流：概率 × k_prob + 评分补正
@@ -1014,7 +1032,8 @@ class DebouncePlugin(BasePlugin):
                     buffer.pop(count=buffer.get_length()-self.max_unmentioned_messages+1)
                 event.buffer()
                 if self.group_proactive_chat and event.is_group_message() \
-                        and not self.enhance.dormant.in_dormant(self.enhance._now_hhmm()):
+                        and not self.enhance.dormant.in_dormant(self.enhance._now_hhmm(), sid) \
+                        and self._is_proactive_allowed(sid):
                     # 存在感节流：概率 × k_prob（回少提高/回多降低）
                     prob = self.group_proactive_chat_probability * self.enhance.k_prob(sid)
                     prob_hit = random.random() < prob

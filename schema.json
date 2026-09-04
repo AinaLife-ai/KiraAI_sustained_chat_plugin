@@ -42,6 +42,12 @@
         "minimum": 0,
         "maximum": 1,
         "hint": "每条非唤醒消息触发主动发言的概率"
+      },
+      "proactive_scope_sessions": {
+        "type": "list",
+        "name": "群聊积极概率作用域（sid）",
+        "default": [],
+        "hint": "仅这些会话启用群聊主动发言，留空=全部启用。格式如 qq:gm:123456"
       }
     }
   },
@@ -878,6 +884,50 @@
         "name": "主动续窗次数上限",
         "default": -1,
         "hint": "bot 主动续窗次数上限，-1 无限，0 不能续"
+      },
+      "dormant_scope_sessions": {
+        "type": "list",
+        "name": "休眠作用域（sid）",
+        "default": [],
+        "hint": "仅这些会话启用休眠时段，留空=全部启用。格式如 qq:gm:123456"
+      },
+      "dormant_whitelist_users": {
+        "type": "list",
+        "name": "休眠白名单（用户）",
+        "default": [],
+        "hint": "这些用户不受休眠限制（被提及直接唤醒），填了不生效。格式如 QQ号"
+      },
+      "dormant_whitelist_sessions": {
+        "type": "list",
+        "name": "休眠白名单（会话）",
+        "default": [],
+        "hint": "这些会话不受休眠限制，填了不生效。格式如 qq:gm:123456"
+      }
+    }
+  },
+  "section_harass_scope": {
+    "type": "section",
+    "name": "防骚扰作用域与白名单",
+    "collapsed": true,
+    "hint": "作用域限定检测会话（留空=全部）；白名单内用户/会话不检测",
+    "fields": {
+      "harass_scope_sessions": {
+        "type": "list",
+        "name": "防骚扰作用域（sid）",
+        "default": [],
+        "hint": "仅这些会话启用骚扰检测，留空=全部启用。格式如 qq:gm:123456"
+      },
+      "harass_whitelist_users": {
+        "type": "list",
+        "name": "防骚扰白名单（用户）",
+        "default": [],
+        "hint": "这些用户不检测骚扰，填了不生效。格式如 QQ号"
+      },
+      "harass_whitelist_sessions": {
+        "type": "list",
+        "name": "防骚扰白名单（会话）",
+        "default": [],
+        "hint": "这些会话不检测骚扰，填了不生效。格式如 qq:gm:123456"
       }
     }
   }
