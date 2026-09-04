@@ -32,7 +32,7 @@ from core.provider import LLMRequest, LLMResponse
 from core.chat.message_elements import Text, Image, Reply, Sticker, Forward, Record
 from queue_merge import BatchMergeScheduler
 from media_recognize import ParallelMediaRecognizer
-from chat_enhance import ChatEnhanceEngine
+from chat_enhance import ChatEnhanceEngine, _safe_int, _safe_float
 
 try:
     from croniter import croniter
@@ -49,10 +49,10 @@ class DebouncePlugin(BasePlugin):
         basic = cfg.get("section_basic", {})
         self.waking_words = basic.get("waking_words", [])
         self.receive_unmentioned = basic.get("receive_unmentioned", True)
-        self.max_unmentioned_messages = int(basic.get("max_unmentioned_messages", 5))
+        self.max_unmentioned_messages = _safe_int(basic.get("max_unmentioned_messages"), 5)
         self.group_chat_prompt = basic.get("group_chat_prompt", "")
         self.group_proactive_chat = basic.get("group_proactive_chat", False)
-        self.group_proactive_chat_probability = float(basic.get("group_proactive_chat_probability", 0.1))
+        self.group_proactive_chat_probability = _safe_float(basic.get("group_proactive_chat_probability"), 0.1)
         self.proactive_scope_sessions = set(
             str(x) for x in (basic.get("proactive_scope_sessions") or [])
         )
@@ -60,19 +60,19 @@ class DebouncePlugin(BasePlugin):
         # ========== 从 section_media 读取媒体处理配置 ==========
         media = cfg.get("section_media", {})
         self.image_recognition_only_on_mention = media.get("image_recognition_only_on_mention", True)
-        self.image_recognition_probability = float(media.get("image_recognition_probability", 1.0))
-        self.max_images_per_message = int(media.get("max_images_per_message", 3))
+        self.image_recognition_probability = _safe_float(media.get("image_recognition_probability"), 1.0)
+        self.max_images_per_message = _safe_int(media.get("max_images_per_message"), 3)
         self.forward_recognition_only_on_mention = media.get("forward_recognition_only_on_mention", True)
         self.voice_recognition_only_on_mention = media.get("voice_recognition_only_on_mention", True)
         self.voice_private_need_mention = media.get("voice_private_need_mention", True)
-        self.voice_max_duration = int(media.get("voice_max_duration", 0))
+        self.voice_max_duration = _safe_int(media.get("voice_max_duration"), 0)
 
         # ========== 从 section_group_sustain 读取群聊持续对话配置 ==========
         group_sustain = cfg.get("section_group_sustain", {})
         self.sustain_enabled = group_sustain.get("sustain_enabled", False)
-        self.sustain_window_seconds = float(group_sustain.get("sustain_window_seconds", 180))
-        self.sustain_reply_probability = float(group_sustain.get("sustain_reply_probability", 0.5))
-        self.max_sustain_replies = int(group_sustain.get("max_sustain_replies", -1))
+        self.sustain_window_seconds = _safe_float(group_sustain.get("sustain_window_seconds"), 180)
+        self.sustain_reply_probability = _safe_float(group_sustain.get("sustain_reply_probability"), 0.5)
+        self.max_sustain_replies = _safe_int(group_sustain.get("max_sustain_replies"), -1)
         self.sustain_stop_keywords = group_sustain.get("sustain_stop_keywords", [])
         self.stop_on_ai_keywords = group_sustain.get("stop_on_ai_keywords", [])
         self.stop_on_ai_empty = group_sustain.get("stop_on_ai_empty", True)
@@ -88,10 +88,10 @@ class DebouncePlugin(BasePlugin):
         dm_sustain = cfg.get("section_dm_sustain", {})
         self.dm_sustain_enabled = dm_sustain.get("dm_sustain_enabled", False)
         self.dm_sustain_window_range = dm_sustain.get("dm_sustain_window_range", "30s/10s")
-        self.dm_sustain_reply_probability = float(dm_sustain.get("dm_sustain_reply_probability", 0.3))
-        self.dm_max_sustain_replies = int(dm_sustain.get("dm_max_sustain_replies", -1))
+        self.dm_sustain_reply_probability = _safe_float(dm_sustain.get("dm_sustain_reply_probability"), 0.3)
+        self.dm_max_sustain_replies = _safe_int(dm_sustain.get("dm_max_sustain_replies"), -1)
         self.dm_sustain_mode = dm_sustain.get("dm_sustain_mode", "per_round")
-        self.dm_max_retry_attempts = int(dm_sustain.get("dm_max_retry_attempts", 3))
+        self.dm_max_retry_attempts = _safe_int(dm_sustain.get("dm_max_retry_attempts"), 3)
         self.dm_sustain_stop_keywords = dm_sustain.get("dm_sustain_stop_keywords", [])
         self.dm_stop_on_ai_keywords = dm_sustain.get("dm_stop_on_ai_keywords", [])
         self.dm_stop_on_ai_empty = dm_sustain.get("dm_stop_on_ai_empty", True)
@@ -112,13 +112,13 @@ class DebouncePlugin(BasePlugin):
         scheduled = cfg.get("section_scheduled", {})
         self.scheduled_enabled = scheduled.get("scheduled_enabled", False)
         self.scheduled_sessions = scheduled.get("scheduled_sessions", [])
-        self.scheduled_max_per_round = int(scheduled.get("scheduled_max_per_round", 1))
+        self.scheduled_max_per_round = _safe_int(scheduled.get("scheduled_max_per_round"), 1)
         self.scheduled_type = scheduled.get("scheduled_type", "interval")
         self.scheduled_interval_expression = scheduled.get("scheduled_interval_expression", "5m/30s")
         self.scheduled_cron = scheduled.get("scheduled_cron", "0 */1 * * *")
-        self.scheduled_context_count = int(scheduled.get("scheduled_context_count", 10))
+        self.scheduled_context_count = _safe_int(scheduled.get("scheduled_context_count"), 10)
         self.scheduled_fetch_history = scheduled.get("scheduled_fetch_history", True)
-        self.scheduled_initial_history_count = int(scheduled.get("scheduled_initial_history_count", 10))
+        self.scheduled_initial_history_count = _safe_int(scheduled.get("scheduled_initial_history_count"), 10)
         self.scheduled_prompt = scheduled.get("scheduled_prompt", "")
         self.scheduled_tool_blacklist = scheduled.get("scheduled_tool_blacklist", [])
         self.scheduled_tool_blacklist_mode = scheduled.get("scheduled_tool_blacklist_mode", "partial")
@@ -127,8 +127,8 @@ class DebouncePlugin(BasePlugin):
         self.session_events: dict[str, asyncio.Event] = {}
         self.session_tasks: dict[str, asyncio.Task] = {}
         bot_cfg = ctx.config["bot_config"].get("bot", {})
-        self.debounce_interval = float(bot_cfg.get("max_message_interval", 1.5))
-        self.max_buffer_messages = int(bot_cfg.get("max_buffer_messages", 3))
+        self.debounce_interval = _safe_float(bot_cfg.get("max_message_interval"), 1.5)
+        self.max_buffer_messages = _safe_int(bot_cfg.get("max_buffer_messages"), 3)
 
         # 群聊持续状态
         self.sustain_until = defaultdict(float)
@@ -485,9 +485,12 @@ class DebouncePlugin(BasePlugin):
         # 若窗口已被提前关闭/刷新，deadline 会变化或消失，避免误清
         deadline = self.sustain_until.get(sid, 0)
         if deadline and time.time() >= deadline:
-            # 直接清理字段，不走 _clear_sustain_window（避免 cancel 自身任务）
+            # 直接清理字段，不走 _clear_sustain_window（避免 cancel 自身任务）。
+            # 任务身份校验：仅当本任务仍是当前窗口任务时才 pop，避免陈旧任务
+            # 误删新窗口任务的引用（与 _dm_sustain_loop 身份校验一致）
+            if self.sustain_tasks.get(sid) is asyncio.current_task():
+                self.sustain_tasks.pop(sid, None)
             self.sustain_until.pop(sid, None)
-            self.sustain_tasks.pop(sid, None)
             self.sustain_judged.pop(sid, None)
             logger.debug(f"[Sustain] 群 {sid} 持续窗口超时结束（保留计数 {self.sustain_count.get(sid, 0)}）")
 
@@ -614,10 +617,13 @@ class DebouncePlugin(BasePlugin):
             return
 
         rand_val = random.random()
-        # 休眠期内不主动触发（休眠时段不主动）
+        # 休眠期内不主动触发（休眠时段不主动）。
+        # 注意：休眠期不消耗重试计数（per_retry 模式下反复重开窗会烧光
+        # dm_max_retry_attempts，休眠结束后不再主动触发）。直接取消窗口，
+        # 保留 retry_count，休眠结束后由用户消息/on_llm_response 重新开窗。
         if self.enhance.dormant.in_dormant(self.enhance._now_hhmm(), sid):
             logger.debug(f"[DM Sustain] 休眠期内不主动触发: {sid}")
-            self._handle_dm_failure(sid, "休眠时段")
+            self._cancel_dm_sustain(sid)
             return
         # 存在感节流：概率 × k_prob（回少提高/回多降低）+ 评分补正
         _dm_prob = self.dm_sustain_reply_probability * self.enhance.k_prob(sid)
@@ -953,7 +959,7 @@ class DebouncePlugin(BasePlugin):
 
         if self.sustain_enabled and event.is_group_message() and not event.is_mentioned and self._is_sustain_allowed(sid):
             if self._is_in_sustain_window(sid):
-                if self.max_sustain_replies != -1 and self.sustain_count[sid] >= self.max_sustain_replies:
+                if self.max_sustain_replies != -1 and self.sustain_count.get(sid, 0) >= self.max_sustain_replies:
                     await self._stop_sustain_round(sid)
                 else:
                     text_content = "".join(elem.text for elem in event.message.chain if isinstance(elem, Text))
@@ -1102,8 +1108,10 @@ class DebouncePlugin(BasePlugin):
         ai_text = (resp.text_response or "").strip()
 
         # 记录本次 LLM 回复所属会话（ignore/wake_extend tag 处理器用）。
-        # 必须在最终文本回复时写：与 tag 解析之间无 await，原子，避免 handle_msg
-        # 期间其他会话消息覆盖导致 tag 作用到错误会话。
+        # 框架 tag 处理器签名只有 (value, **attrs) 无 event 上下文（core/tag/base.py），
+        # _last_ignore_sid 是唯一通道。在最终文本回复时写入已把竞态窗口缩到最小
+        # （on_llm_response 返回后框架才解析 XML 执行 tag，期间其他会话的
+        # on_llm_response 可能覆盖——多会话并发回复时概率触发，已知限制）。
         self._last_ignore_sid = sid
 
         # provider 全挂时框架返回 "[ProviderError] ..." 错误文本（无 tool_calls，
@@ -1178,7 +1186,7 @@ class DebouncePlugin(BasePlugin):
                 logger.debug(f"[Sustain] 群 {sid} 本轮已终止，在途回复不开窗")
                 return
 
-            if self.max_sustain_replies == -1 or self.sustain_count[sid] < self.max_sustain_replies:
+            if self.max_sustain_replies == -1 or self.sustain_count.get(sid, 0) < self.max_sustain_replies:
                 if self.sustain_judge_timing == "llm_processing":
                     # 判定仅在 LLM 处理期间进行，回复后关闭兜底窗，
                     # 避免 LLM 请求时开的固定时长窗口在回复后剩余时间内继续判定
