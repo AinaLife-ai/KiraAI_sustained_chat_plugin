@@ -670,6 +670,30 @@
         "name": "评分阈值",
         "default": 60,
         "hint": "评分补正判定阈值（0-100，越高越挑剔）"
+      },
+      "score_increment": {
+        "name": "评分加分（每条用户消息）",
+        "type": "float",
+        "default": 1,
+        "hint": "累计加分机制：每条用户消息 +N 分，攒到评分阈值补触发一次后清零。默认 1"
+      },
+      "score_penalty": {
+        "name": "评分扣分（每次 bot 回复）",
+        "type": "float",
+        "default": 5,
+        "hint": "累计加分机制：bot 每次回复 -N 分（下限 0）。bot 回复越多分越低，补触发越少"
+      },
+      "score_cap": {
+        "name": "评分上限",
+        "type": "float",
+        "default": 100,
+        "hint": "累计分上限，防止长时间无 bot 回复时分数无限累积"
+      },
+      "idle_bonus_ratio": {
+        "name": "闲时判定倍数",
+        "type": "float",
+        "default": 1.5,
+        "hint": "相对判定：静默时长超过该会话历史平均静默 × 倍数才算闲时（冷场）。活跃群/死群标准不同。0=不判闲时（闲时加分关闭）"
       }
     }
   },

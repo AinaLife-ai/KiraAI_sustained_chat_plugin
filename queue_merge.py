@@ -455,6 +455,14 @@ class BatchMergeScheduler:
                             continue
                     else:
                         self._log(sid, f"in-flight 卡死兜底（>{self.inflight_stall_timeout:.0f}s 无收尾），强制推送 pending")
+                else:
+                    # in-flight 已收尾 / 空闲：正常路径，走防抖窗口（与 _push_pending 一致）。
+                    # 最后一条消息到达后 merge_window_seconds 内不发布，期间新消息
+                    # 到达会重置 _last_arrival，把突发合并完再 flush。
+                    last = self._last_arrival.get(sid, 0.0)
+                    if now - last < self.merge_window_seconds:
+                        self._log(sid, f"tick 防抖等待（窗口 {self.merge_window_seconds}s，距最后消息 {now - last:.1f}s）")
+                        continue
                 merged = self._decide_and_apply_locked(sid)
                 if merged is not None:
                     to_publish.append(merged)
