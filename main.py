@@ -28,6 +28,7 @@ for _m in ("queue_merge", "media_recognize", "chat_enhance"):
 
 from core.plugin import BasePlugin, logger, on, Priority, register
 from core.chat.message_utils import KiraMessageEvent, KiraMessageBatchEvent
+from core.chat import KiraIMMessage, User, Group, Session, MessageChain
 from core.provider import LLMRequest, LLMResponse
 from core.chat.message_elements import Text, Image, Reply, Sticker, Forward, Record
 from queue_merge import BatchMergeScheduler
@@ -246,11 +247,15 @@ class DebouncePlugin(BasePlugin):
         for task in self.sustain_tasks.values():
             if not task.done():
                 task.cancel()
+        if self.sustain_tasks:
+            await asyncio.gather(*self.sustain_tasks.values(), return_exceptions=True)
         self.sustain_tasks.clear()
 
         for task in self.dm_sustain_tasks.values():
             if not task.done():
                 task.cancel()
+        if self.dm_sustain_tasks:
+            await asyncio.gather(*self.dm_sustain_tasks.values(), return_exceptions=True)
         self.dm_sustain_tasks.clear()
 
         if self._scheduler_task and not self._scheduler_task.done():
@@ -262,8 +267,8 @@ class DebouncePlugin(BasePlugin):
 
         # 清理合并调度器（重发 pending + 取消 tick）
         await self.merge_scheduler.shutdown()
-        # 关闭聊天增强引擎
-        self.enhance.shutdown()
+        # 关闭聊天增强引擎（await 等待 prune 任务退出）
+        await self.enhance.shutdown()
         logger.info("[Debounce] 插件已终止")
 
     # ========== 工具函数 ==========
@@ -680,7 +685,6 @@ class DebouncePlugin(BasePlugin):
 
         # 对齐官方 PluginContext.publish_notice 的事件构造方式
         # （core/plugin/plugin_context.py），再覆盖 session 到真实私聊 sid
-        from core.chat import KiraMessageEvent, KiraIMMessage, User, Session, MessageChain
         cur_time = int(time.time())
         user = User(user_id="system_proactive_dm", nickname="系统主动触发")
         chain = MessageChain([Text(self.dm_proactive_prompt)])
@@ -798,7 +802,6 @@ class DebouncePlugin(BasePlugin):
             return
 
         # 对齐官方 publish_notice 构造；群聊必须带 group，否则 is_group_message() 会错
-        from core.chat import KiraMessageEvent, KiraIMMessage, User, Group, Session, MessageChain
         cur_time = int(time.time())
         user = User(user_id="system_scheduled", nickname="定时任务")
         prompt_text = self.scheduled_prompt or "请根据当前对话上下文，自然地发送一条消息。"
@@ -875,7 +878,7 @@ class DebouncePlugin(BasePlugin):
 
     # ========== 消息处理钩子 ==========
     @on.im_message(priority=Priority.HIGH)
-    async def handle_msg(self, event: KiraMessageEvent):
+    async def handle_msg(self, event: KiraMessageEvent, *_):
         # --- 修复：过滤机器人自己的私聊消息 ---
         if not event.is_group_message():
             # 正确获取 self_id
@@ -1103,7 +1106,7 @@ class DebouncePlugin(BasePlugin):
 
     # ========== LLM 响应钩子 ==========
     @on.llm_response(priority=Priority.HIGH)
-    async def on_llm_response(self, event: KiraMessageBatchEvent, resp: LLMResponse):
+    async def on_llm_response(self, event: KiraMessageBatchEvent, resp: LLMResponse, *_):
         sid = event.sid
 
         # 官方 AgentExecutor 在每一步都会触发 ON_LLM_RESPONSE（含 tool_calls 中间步）。
