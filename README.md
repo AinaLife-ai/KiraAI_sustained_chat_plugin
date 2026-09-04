@@ -1,4 +1,4 @@
-# KiraAI_sustained_chat_plugin/可持续聊天 2.4.1
+# KiraAI_sustained_chat_plugin/可持续聊天 v2.4.2
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI_sustained_chat_plugin)
 
@@ -346,12 +346,16 @@ croniter>=1.3.0
 
 ## 📝 版本信息
 
-- 当前版本：v2.4.1
+- 当前版本：v2.4.2
 - 兼容 KiraAI：v2.29.6+（插件图标需 v2.30.0+）
 - 作者：KiraAI + znq19
 
 <details>
 <summary>更新日志</summary>
+
+### v2.4.2
+
+- 评分补正拆为 `score_gate_deny`（门槛过滤）+ `score_gate_boost`（补偿触发），三条通路（section_presence / section_group_sustain / section_dm_sustain）各自独立控制
 
 ### v2.4.1
 
