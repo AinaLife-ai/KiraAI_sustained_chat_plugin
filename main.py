@@ -51,7 +51,7 @@ class DebouncePlugin(BasePlugin):
         self.waking_words = basic.get("waking_words", [])
         self.receive_unmentioned = basic.get("receive_unmentioned", True)
         self.max_unmentioned_messages = _safe_int(basic.get("max_unmentioned_messages"), 5)
-        self.group_chat_prompt = basic.get("group_chat_prompt", "")
+        self.group_chat_prompt = basic.get("group_chat_prompt", '### 群聊环境说明\r\n\r\n当前为群聊环境，你需要聚焦于**和你有直接关联**或**你十分感兴趣**的消息，对于仅显示为[动画表情]或[图片]的消息不用互动，注意不要刷屏，可以选择不回复任何消息，直接输出<msg/>即可。\r\n\r\n## 消息感知\r\n\r\n你可能会同时收到多条消息，请根据上下文自主决策该回复哪些消息，注意不要刷屏，也可以选择不回复任何消息，直接输出<msg/>即可。\r\n你可以使用 <reasoning>reasoning_content</reasoning> 的标签格式来输出推理内容放在整个输出的最前面，用于推理应该回复哪些消息，回复语气，回复条数，消息分段情况等。\r\n<reasoning>标签和<msg>标签同级，**禁止**将次标签放到<msg>标签内。\r\n**符合以上规则的情况下**确保你想发的聊天消息在<text>标签内，不要遗漏。\r\n')
         self.group_proactive_chat = basic.get("group_proactive_chat", False)
         self.group_proactive_chat_probability = _safe_float(basic.get("group_proactive_chat_probability"), 0.1)
         self.proactive_scope_sessions = set(
@@ -62,12 +62,12 @@ class DebouncePlugin(BasePlugin):
 
         # ========== 从 section_media 读取媒体处理配置 ==========
         media = cfg.get("section_media", {})
-        self.image_recognition_only_on_mention = media.get("image_recognition_only_on_mention", True)
+        self.image_recognition_only_on_mention = media.get("image_recognition_only_on_mention", False)
         self.image_recognition_probability = _safe_float(media.get("image_recognition_probability"), 1.0)
         self.max_images_per_message = _safe_int(media.get("max_images_per_message"), 3)
         self.forward_recognition_only_on_mention = media.get("forward_recognition_only_on_mention", True)
-        self.voice_recognition_only_on_mention = media.get("voice_recognition_only_on_mention", True)
-        self.voice_private_need_mention = media.get("voice_private_need_mention", True)
+        self.voice_recognition_only_on_mention = media.get("voice_recognition_only_on_mention", False)
+        self.voice_private_need_mention = media.get("voice_private_need_mention", False)
         self.voice_max_duration = _safe_int(media.get("voice_max_duration"), 0)
 
         # ========== 从 section_group_sustain 读取群聊持续对话配置 ==========
@@ -77,9 +77,9 @@ class DebouncePlugin(BasePlugin):
         self.sustain_reply_probability = _safe_float(group_sustain.get("sustain_reply_probability"), 0.5)
         self.max_sustain_replies = _safe_int(group_sustain.get("max_sustain_replies"), -1)
         self.sustain_stop_keywords = group_sustain.get("sustain_stop_keywords", [])
-        self.stop_on_ai_keywords = group_sustain.get("stop_on_ai_keywords", [])
+        self.stop_on_ai_keywords = group_sustain.get("stop_on_ai_keywords", ['晚安', '再见', '拜拜', '下次再聊', '下次聊', '不聊了', '不想理', '不理你', '不说了'])
         self.stop_on_ai_empty = group_sustain.get("stop_on_ai_empty", True)
-        self.sustain_mode = group_sustain.get("sustain_mode", "per_message")
+        self.sustain_mode = group_sustain.get("sustain_mode", "per_round")
         # 新增：群聊持续对话作用域（白名单/黑名单）与 LLM 请求时开窗判定
         self.sustain_allowed_sessions = group_sustain.get("sustain_allowed_sessions", [])
         self.sustain_denied_sessions = group_sustain.get("sustain_denied_sessions", [])
@@ -90,13 +90,13 @@ class DebouncePlugin(BasePlugin):
         # ========== 从 section_dm_sustain 读取私聊持续对话配置 ==========
         dm_sustain = cfg.get("section_dm_sustain", {})
         self.dm_sustain_enabled = dm_sustain.get("dm_sustain_enabled", False)
-        self.dm_sustain_window_range = dm_sustain.get("dm_sustain_window_range", "30s/10s")
+        self.dm_sustain_window_range = dm_sustain.get("dm_sustain_window_range", "60s/45s")
         self.dm_sustain_reply_probability = _safe_float(dm_sustain.get("dm_sustain_reply_probability"), 0.3)
         self.dm_max_sustain_replies = _safe_int(dm_sustain.get("dm_max_sustain_replies"), -1)
-        self.dm_sustain_mode = dm_sustain.get("dm_sustain_mode", "per_round")
+        self.dm_sustain_mode = dm_sustain.get("dm_sustain_mode", "per_retry")
         self.dm_max_retry_attempts = _safe_int(dm_sustain.get("dm_max_retry_attempts"), 3)
         self.dm_sustain_stop_keywords = dm_sustain.get("dm_sustain_stop_keywords", [])
-        self.dm_stop_on_ai_keywords = dm_sustain.get("dm_stop_on_ai_keywords", [])
+        self.dm_stop_on_ai_keywords = dm_sustain.get("dm_stop_on_ai_keywords", ['晚安', '再见', '拜拜', '下次再聊', '下次聊', '不聊了', '不想理', '不理你', '不说了'])
         self.dm_stop_on_ai_empty = dm_sustain.get("dm_stop_on_ai_empty", True)
         self.dm_allowed_users = dm_sustain.get("dm_allowed_users", [])
         self.dm_denied_users = dm_sustain.get("dm_denied_users", [])
@@ -119,12 +119,12 @@ class DebouncePlugin(BasePlugin):
         self.scheduled_sessions = scheduled.get("scheduled_sessions", [])
         self.scheduled_max_per_round = _safe_int(scheduled.get("scheduled_max_per_round"), 1)
         self.scheduled_type = scheduled.get("scheduled_type", "interval")
-        self.scheduled_interval_expression = scheduled.get("scheduled_interval_expression", "5m/30s")
+        self.scheduled_interval_expression = scheduled.get("scheduled_interval_expression", "5m/270s")
         self.scheduled_cron = scheduled.get("scheduled_cron", "0 */1 * * *")
         self.scheduled_context_count = _safe_int(scheduled.get("scheduled_context_count"), 10)
         self.scheduled_fetch_history = scheduled.get("scheduled_fetch_history", True)
         self.scheduled_initial_history_count = _safe_int(scheduled.get("scheduled_initial_history_count"), 10)
-        self.scheduled_prompt = scheduled.get("scheduled_prompt", "")
+        self.scheduled_prompt = scheduled.get("scheduled_prompt", '根据人设和上下文自然发言与使用你想用的工具并返回结果，严禁暴露这是定时任务')
         self.scheduled_tool_blacklist = scheduled.get("scheduled_tool_blacklist", [])
         self.scheduled_tool_blacklist_mode = scheduled.get("scheduled_tool_blacklist_mode", "partial")
 
