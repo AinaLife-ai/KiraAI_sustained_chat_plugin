@@ -362,17 +362,9 @@ class DebouncePlugin(BasePlugin):
     async def handle_poke_ignore(self, value: str, **kwargs) -> list:
         return self._apply_ignore_tag("poke", value)
 
-    @register.tag(name="at_ignore", description="屏蔽连续 at 骚扰。输出 <at_ignore>user|duration:N</at_ignore> 屏蔽目标用户，<at_ignore>all|duration:N</at_ignore> 屏蔽所有用户，<at_ignore>none</at_ignore> 不屏蔽。")
-    async def handle_at_ignore(self, value: str, **kwargs) -> list:
-        return self._apply_ignore_tag("at", value)
-
-    @register.tag(name="kw_ignore", description="屏蔽连续关键词唤醒骚扰。输出 <kw_ignore>user|duration:N</kw_ignore> 屏蔽目标用户，<kw_ignore>all|duration:N</kw_ignore> 屏蔽所有用户，<kw_ignore>none</kw_ignore> 不屏蔽。")
-    async def handle_kw_ignore(self, value: str, **kwargs) -> list:
-        return self._apply_ignore_tag("keyword", value)
-
-    @register.tag(name="reply_ignore", description="屏蔽引用唤醒骚扰。输出 <reply_ignore>user|duration:N</reply_ignore> 屏蔽目标用户，<reply_ignore>all|duration:N</reply_ignore> 屏蔽所有用户，<reply_ignore>none</reply_ignore> 不屏蔽。")
-    async def handle_reply_ignore(self, value: str, **kwargs) -> list:
-        return self._apply_ignore_tag("reply", value)
+    @register.tag(name="ignore", description="拉黑用户：屏蔽后该用户/会话的所有消息不再进入（含戳一戳/at/关键词/引用/刷屏）。输出 <ignore>user|duration:N</ignore> 拉黑目标用户，<ignore>all|duration:N</ignore> 拉黑所有用户，<ignore>none</ignore> 不屏蔽。duration 为秒，留空用默认值。")
+    async def handle_ignore(self, value: str, **kwargs) -> list:
+        return self._apply_ignore_tag("all", value)
 
     def _apply_ignore_tag(self, kind: str, value: str) -> list:
         """解析骚扰屏蔽 tag 值并执行屏蔽。返回空列表（tag 不产生消息输出）。"""
@@ -409,8 +401,8 @@ class DebouncePlugin(BasePlugin):
                 },
                 "block_type": {
                     "type": "string",
-                    "enum": ["poke", "at", "keyword", "reply", "all"],
-                    "description": "屏蔽的唤醒方式：poke=戳一戳，at=连续at，keyword=连续关键词，reply=引用唤醒，all=全部",
+                    "enum": ["poke", "all"],
+                    "description": "屏蔽类型：poke=只屏蔽戳一戳（其他形式正常），all=拉黑（该用户/会话所有消息不再进入，含戳一戳）",
                     "default": "all",
                 },
                 "duration": {
@@ -646,7 +638,7 @@ class DebouncePlugin(BasePlugin):
         # 存在感节流：概率 × k_prob（回少提高/回多降低）+ 评分补正
         _dm_prob = self.dm_sustain_reply_probability * self.enhance.k_prob(sid)
         _dm_hit = rand_val < _dm_prob
-        if self.enhance.score_gate(sid, _dm_hit, scope="dm_sustain"):
+        if self.enhance.score_gate(sid, _dm_hit, scope="dm_sustain", prob=_dm_prob):
             self.dm_sustain_count[sid] += 1
             count = self.dm_sustain_count[sid]
             # 成功发送后重置重试计数（保留主动次数）
@@ -889,6 +881,17 @@ class DebouncePlugin(BasePlugin):
                 event.discard()
                 return
 
+        # === 拉黑拦截：被屏蔽的用户/会话消息完全不进 LLM（不 buffer/flush/不触发） ===
+        try:
+            _sid = event.session.sid
+            _uid = str(event.message.sender.user_id) if event.message.sender else "unknown"
+            if self.enhance.harass.is_blocked(_sid, _uid, time.time()):
+                logger.debug(f"[Enhance] 拉黑拦截: {_sid} 用户 {_uid} 的消息不进 LLM")
+                event.discard()
+                return
+        except Exception:
+            pass
+
         # 唤醒词检测（区分真 @ 与唤醒词命中：框架在循环前已标记真 @）
         _was_mentioned = bool(getattr(event, "is_mentioned", False))
         for m in event.message.chain:
@@ -995,7 +998,7 @@ class DebouncePlugin(BasePlugin):
                         else:
                             _sustain_prob = self.sustain_reply_probability * self.enhance.k_prob(sid)
                             _sustain_hit = random.random() < _sustain_prob
-                            if self.enhance.score_gate(sid, _sustain_hit, scope="sustain"):
+                            if self.enhance.score_gate(sid, _sustain_hit, scope="sustain", prob=_sustain_prob):
                                 event.message.is_mentioned = True
                                 self.sustain_count[sid] += 1
                                 _mid = getattr(event.message, "message_id", None)
@@ -1025,7 +1028,7 @@ class DebouncePlugin(BasePlugin):
                                 # 存在感节流：概率 × k_prob + 评分补正
                                 _sustain_prob = self.sustain_reply_probability * self.enhance.k_prob(sid)
                                 _sustain_hit = random.random() < _sustain_prob
-                                if self.enhance.score_gate(sid, _sustain_hit, scope="sustain"):
+                                if self.enhance.score_gate(sid, _sustain_hit, scope="sustain", prob=_sustain_prob):
                                     event.message.is_mentioned = True
                                     self.sustain_count[sid] += 1
                                     _mid = getattr(event.message, "message_id", None)
@@ -1060,7 +1063,7 @@ class DebouncePlugin(BasePlugin):
                     prob = self.group_proactive_chat_probability * self.enhance.k_prob(sid)
                     prob_hit = random.random() < prob
                     # 评分补正：评分不足概率命中作废；评分够概率未命中补触发
-                    if self.enhance.score_gate(sid, prob_hit):
+                    if self.enhance.score_gate(sid, prob_hit, prob=prob):
                         logger.info("[Chat] Triggered proactive chat")
                         event.flush()
             else:
