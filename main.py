@@ -445,7 +445,8 @@ class DebouncePlugin(BasePlugin):
         return allowed
 
     def _is_in_sustain_window(self, sid: str) -> bool:
-        return time.time() < self.sustain_until[sid]
+        # 用 .get 避免 defaultdict 隐式建键（与 _is_in_dm_sustain 一致）
+        return time.time() < self.sustain_until.get(sid, 0.0)
 
     def _start_sustain_window(self, sid: str):
         deadline = time.time() + self.sustain_window_seconds
@@ -619,8 +620,11 @@ class DebouncePlugin(BasePlugin):
                 )
             )
             await self._trigger_dm_proactive(sid)
-            # 只关窗，保留 count，供后续 on_llm_response / 下次开窗判断 max
-            self._cancel_dm_sustain(sid)
+            # 只关窗，保留 count，供后续 on_llm_response / 下次开窗判断 max。
+            # 注意：await 期间 on_llm_response 可能已对同一 sid 开新窗口，
+            # 必须校验任务身份，避免误杀新窗口。
+            if self.dm_sustain_tasks.get(sid) is asyncio.current_task():
+                self._cancel_dm_sustain(sid)
         else:
             logger.debug(f"[DM Sustain] 未命中: {sid} (概率 {rand_val:.2f} >= {_dm_prob:.2f})")
             self._handle_dm_failure(sid, "概率未命中")
@@ -866,8 +870,10 @@ class DebouncePlugin(BasePlugin):
             self._process_media(event.message.chain, is_mentioned, is_private=True)
 
         sid = event.session.sid
-        # 记录最近会话（骚扰屏蔽 tag 处理器用）
-        self._last_ignore_sid = sid
+        # 注意：不在此记录 _last_ignore_sid（旧实现）。ignore/wake_extend tag 是
+        # LLM 回复的输出，on_llm_response 已记录本次回复所属会话；handle_msg 里
+        # 记录会被任意新消息（含不触发 LLM 的围观消息）覆盖，造成 tag 作用到
+        # 错误会话的竞态。
 
         # === 聊天增强引擎：存在感记录 + 骚扰检测 + 休眠判定 ===
         self.enhance.on_im_message(event)
@@ -1075,6 +1081,11 @@ class DebouncePlugin(BasePlugin):
             logger.debug(f"[Enhance] 休眠维持期达最大互动次数，结束: {sid}")
 
         ai_text = (resp.text_response or "").strip()
+
+        # 记录本次 LLM 回复所属会话（ignore/wake_extend tag 处理器用）。
+        # 必须在最终文本回复时写：与 tag 解析之间无 await，原子，避免 handle_msg
+        # 期间其他会话消息覆盖导致 tag 作用到错误会话。
+        self._last_ignore_sid = sid
 
         # provider 全挂时框架返回 "[ProviderError] ..." 错误文本（无 tool_calls，
         # agent_executor 标记 is_final=True 直接收尾）。它不是真实 AI 回复：若按正常
