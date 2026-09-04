@@ -210,7 +210,9 @@ class DebouncePlugin(BasePlugin):
             if _pm is not None:
                 _loaded = set()
                 try:
-                    _loaded = set(_pm.get_loaded_plugin_ids() or [])
+                    # 框架 PluginManager 无 get_loaded_plugin_ids，用 list_plugins 取 plugin_id
+                    _infos = _pm.list_plugins() if hasattr(_pm, "list_plugins") else []
+                    _loaded = set(getattr(i, "plugin_id", "") for i in (_infos or []))
                 except Exception:
                     pass
                 if any("anti-harass" in str(pid).lower() for pid in _loaded):
