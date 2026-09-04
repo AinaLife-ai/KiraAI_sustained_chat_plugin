@@ -72,6 +72,7 @@ Shana: 牛肉面！听起来好香，我也想吃！
 | **次数控制** | `dm_max_sustain_replies` 限制连续主动回复次数 |
 | **重试控制** | `per_retry` 模式下，`dm_max_retry_attempts` 限制失败后最多重试次数 |
 | **停止关键词** | 用户/AI消息含停止词终止窗口 |
+| **私聊独立存在感节流** | `dm_presence_enabled`（默认开）：私聊有独立的 k_prob 调节系数与评分参数（窗口 10 条、目标占比 0.7、阈值 30、加分 2 扣分 3），默认值更适合一对一节奏，也可关掉与群聊共享 |
 
 ```yaml
 # 私聊场景
@@ -277,14 +278,14 @@ AI: 对了主人，我刚刚看到一个好笑的视频，想不想看？
 
 | 模块 | 功能 |
 |------|------|
-| `section_basic` | 唤醒词、非唤醒消息缓冲、群聊主动发言 |
+| `section_basic` | 唤醒词、非唤醒消息缓冲、群聊主动发言、**群聊主动概率评分/概率调节** |
 | `section_media` | 图片/语音/转发消息的识别与过滤 |
 | `section_group_sustain` | 群聊持续对话（窗口、概率、模式、停止词） |
-| `section_dm_sustain` | 私聊持续对话（窗口、概率、重试、黑白名单、提示词、工具黑名单） |
+| `section_dm_sustain` | 私聊持续对话 + **私聊独立存在感节流参数** + **评分补正/概率调节开关** |
 | `section_scheduled` | 定时主动任务（间隔/Cron、会话列表、工具黑名单、提示词） |
 | `section_queue_merge` | 队列合并/积压处理（积压批次合并推送，更省 token） |
 | `section_media_recognition` | 并行媒体识别（图片 VLM + 语音 STT 并行预处理，回复更快） |
-| `section_presence` | 存在感节流（bot 发言占比 → k_prob 调节系数，回少提高/回多降低） |
+| `section_presence` | 存在感节流 + **提及消息评分（群聊/私聊）** |
 | `section_poke` / `section_at` / `section_keyword` / `section_reply` | 骚扰感知化（戳/at/关键词/引用检测 + XML 决策屏蔽） |
 | `section_dormant` | 休眠时段（起夜概率 + 维持期 + 主动续窗限制） |
 
@@ -353,11 +354,14 @@ croniter>=1.3.0
 <details>
 <summary>更新日志</summary>
 
+### v2.4.4
+
+- **私聊独立存在感节流**：`dm_presence_enabled`（默认开），私聊有独立评分/k_prob 参数（窗口 10 条、目标占比 0.7、阈值 30、加分 2 扣分 3）
+- **概率调节独立开关**：`proactive_k_prob_enabled`（默认开）、`sustain_k_prob_enabled`（默认关）、`dm_k_prob_enabled`（默认关）
+- **评分补正细化**：`proactive_score_gate_deny/boost`（section_basic，默认开）+ `sustain_score_gate_deny/boost`（默认关）+ `dm_sustain_score_gate_deny/boost`（默认关）+ `mentioned_score_gate_deny/boost`（群聊提及，默认关）+ `mentioned_dm_score_gate_deny/boost`（私聊提及，默认关）
+- **提及消息评分**：`mentioned_score_gate_deny/boost`（群聊）和 `mentioned_dm_score_gate_deny/boost`（私聊），默认全关
+
 ### v2.4.2
-
-- 评分补正拆为 `score_gate_deny`（门槛过滤）+ `score_gate_boost`（补偿触发），三条通路（section_presence / section_group_sustain / section_dm_sustain）各自独立控制
-
-### v2.4.1
 
 - 拉黑语义：屏蔽=该用户/会话所有消息不再进入（含戳一戳/at/关键词/引用/刷屏）；poke 单独屏蔽只挡戳一戳
 - 累计评分：用户消息 +1、bot 回复 -5，攒到阈值补触发一次后清零（必补）
