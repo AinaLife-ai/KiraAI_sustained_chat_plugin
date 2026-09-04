@@ -48,6 +48,12 @@
         "name": "群聊积极概率作用域（sid）",
         "default": [],
         "hint": "仅这些会话启用群聊主动发言，留空=全部启用。格式如 qq:gm:123456"
+      },
+      "enable_manage_ignore": {
+        "type": "switch",
+        "name": "主动屏蔽工具（manage_ignore）",
+        "default": true,
+        "hint": "关闭后 bot 不再能主动调用屏蔽工具（仍可响应 XML tag 屏蔽），默认开启"
       }
     }
   },
@@ -204,6 +210,12 @@
         "name": "空消息后评分补上再触发",
         "default": false,
         "hint": "开启后 bot 输出空消息只是这次不回，窗口保留，评分补上时再给一次触发机会（默认关）"
+      },
+      "sustain_score_gate_enabled": {
+        "type": "switch",
+        "name": "群聊持续对话评分补正",
+        "default": false,
+        "hint": "仅对群聊持续对话概率生效的评分补正开关（独立于全局评分补正），默认关闭"
       }
     }
   },
@@ -329,6 +341,12 @@
         ],
         "default": "partial",
         "hint": "partial: 工具名包含关键词即禁用；exact: 完全匹配才禁用"
+      },
+      "dm_sustain_score_gate_enabled": {
+        "type": "switch",
+        "name": "私聊持续对话评分补正",
+        "default": false,
+        "hint": "仅对私聊持续对话概率生效的评分补正开关（独立于全局评分补正），默认关闭"
       }
     }
   },

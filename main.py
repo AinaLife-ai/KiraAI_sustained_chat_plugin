@@ -56,6 +56,8 @@ class DebouncePlugin(BasePlugin):
         self.proactive_scope_sessions = set(
             str(x) for x in (basic.get("proactive_scope_sessions") or [])
         )
+        # 主动屏蔽工具开关（manage_ignore）：关闭后 bot 不再能主动屏蔽骚扰
+        self.enable_manage_ignore = basic.get("enable_manage_ignore", True)
 
         # ========== 从 section_media 读取媒体处理配置 ==========
         media = cfg.get("section_media", {})
@@ -174,6 +176,13 @@ class DebouncePlugin(BasePlugin):
         for _k in ("dormant_scope_sessions", "dormant_whitelist_users", "dormant_whitelist_sessions"):
             if _k in _dscope:
                 _enhance_cfg[_k] = _dscope[_k]
+        # 评分补正独立开关（群聊持续对话 / 私聊持续对话）
+        _gscope = cfg.get("section_group_sustain", {}) or {}
+        if "sustain_score_gate_enabled" in _gscope:
+            _enhance_cfg["sustain_score_gate_enabled"] = _gscope["sustain_score_gate_enabled"]
+        _dmscope = cfg.get("section_dm_sustain", {}) or {}
+        if "dm_sustain_score_gate_enabled" in _dmscope:
+            _enhance_cfg["dm_sustain_score_gate_enabled"] = _dmscope["dm_sustain_score_gate_enabled"]
         self.enhance = ChatEnhanceEngine(ctx, _enhance_cfg, self, merge_seconds=self.debounce_interval)
 
     async def initialize(self):
@@ -630,7 +639,7 @@ class DebouncePlugin(BasePlugin):
         # 存在感节流：概率 × k_prob（回少提高/回多降低）+ 评分补正
         _dm_prob = self.dm_sustain_reply_probability * self.enhance.k_prob(sid)
         _dm_hit = rand_val < _dm_prob
-        if self.enhance.score_gate(sid, _dm_hit):
+        if self.enhance.score_gate(sid, _dm_hit, scope="dm_sustain"):
             self.dm_sustain_count[sid] += 1
             count = self.dm_sustain_count[sid]
             # 成功发送后重置重试计数（保留主动次数）
@@ -981,7 +990,7 @@ class DebouncePlugin(BasePlugin):
                         else:
                             _sustain_prob = self.sustain_reply_probability * self.enhance.k_prob(sid)
                             _sustain_hit = random.random() < _sustain_prob
-                            if self.enhance.score_gate(sid, _sustain_hit):
+                            if self.enhance.score_gate(sid, _sustain_hit, scope="sustain"):
                                 event.message.is_mentioned = True
                                 self.sustain_count[sid] += 1
                                 _mid = getattr(event.message, "message_id", None)
@@ -1011,7 +1020,7 @@ class DebouncePlugin(BasePlugin):
                                 # 存在感节流：概率 × k_prob + 评分补正
                                 _sustain_prob = self.sustain_reply_probability * self.enhance.k_prob(sid)
                                 _sustain_hit = random.random() < _sustain_prob
-                                if self.enhance.score_gate(sid, _sustain_hit):
+                                if self.enhance.score_gate(sid, _sustain_hit, scope="sustain"):
                                     event.message.is_mentioned = True
                                     self.sustain_count[sid] += 1
                                     _mid = getattr(event.message, "message_id", None)
@@ -1215,6 +1224,11 @@ class DebouncePlugin(BasePlugin):
     async def filter_proactive_tools(self, event: KiraMessageBatchEvent, req: LLMRequest, *_):
         # 聊天增强引擎：注入合并通知（骚扰/唤醒/存在感状态）
         self.enhance.on_llm_request(event, req)
+
+        # 主动屏蔽工具开关：关闭时从 tool_set 移除 manage_ignore（bot 不再能主动屏蔽）
+        if not self.enable_manage_ignore:
+            self._filter_tools(req.tool_set, ["manage_ignore"], "exact")
+            logger.debug("[Enhance] manage_ignore 工具已禁用（enable_manage_ignore=false）")
 
         if not hasattr(event, 'messages') or not event.messages:
             return
