@@ -1,4 +1,4 @@
-# KiraAI_sustained_chat_plugin/可持续聊天 2.4.0
+# KiraAI_sustained_chat_plugin/可持续聊天 2.4.1
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI_sustained_chat_plugin)
 
@@ -340,20 +340,25 @@ croniter>=1.3.0
 
 ## 🙏 致谢
 
-本插件的存在感节流（回少提高/回多降低）、休眠时段（起夜概率 + 维持期）等机制，在设计上参考并致敬了 **NoriEngine Chat**（[skyzhishui/kira-ai-plugin-noriengine-chat](https://github.com/skyzhishui/kira-ai-plugin-noriengine-chat)）的评分引擎思路——它率先用"存在感抑制 + 时段调度"让 KiraAI 在群聊中也有了心跳包的感受，监听全局消息成为可能，融合版在此基础上把语义判断交还给 LLM，规则只做节流与状态管理。感谢 skyzhishui 的先行探索。
+本插件的存在感节流（回少提高/回多降低）、休眠时段（起夜概率 + 维持期）等机制，在设计上参考并致敬了 **NoriEngine Chat**（[skyzhishui/kira-ai-plugin-noriengine-chat](https://github.com/skyzhishui/kira-ai-plugin-noriengine-chat)）的评分引擎思路——它率先用"存在感抑制 + 时段调度"让 AI 在群聊中得体地主动，融合版在此基础上把语义判断交还给 LLM，规则只做节流与状态管理。感谢 skyzhishui 的先行探索。
 
 ---
 
 ## 📝 版本信息
 
-- 当前版本：v2.4.0
+- 当前版本：v2.4.1
 - 兼容 KiraAI：v2.29.6+（插件图标需 v2.30.0+）
 - 作者：KiraAI + znq19
 
 <details>
 <summary>更新日志</summary>
 
-### v2.4.0
+### v2.4.1
+
+- 拉黑语义：屏蔽=该用户/会话所有消息不再进入（含戳一戳/at/关键词/引用/刷屏）；poke 单独屏蔽只挡戳一戳
+- 累计评分：用户消息 +1、bot 回复 -5，攒到阈值补触发一次后清零（必补）
+- tick 防抖：修复积压批次被单独发布不合并的问题
+- XML 合并：at_ignore/kw_ignore/reply_ignore 合并为 <ignore>（拉黑）
 
 **存在感节流（`section_presence`）**
 - 统计最近 N 条消息的 bot 发言占比，动态调节触发概率：回少提高、回多降低（k_prob 调节系数，钳制在 `presence_k_min`~`presence_k_max`）
