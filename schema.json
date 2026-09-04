@@ -520,9 +520,9 @@
       },
       "merge_window_seconds": {
         "type": "float",
-        "name": "合并窗口顺延（秒）",
+        "name": "消息合并间隔顺延（秒）",
         "default": 0,
-        "hint": "最后一条消息到达后 N 秒无新消息才合并推送（防抖重置：期间新消息到达窗口重置）。0=自动：取框架最大消息合并间隔（bot_config.bot.max_message_interval，默认 2s）"
+        "hint": "最后一条消息到达后 N 秒无新消息才合并推送（防抖重置：期间新消息到达窗口重置）。0=自动：取框架最大消息合并间隔（bot_config.bot.max_message_interval，默认 2s）。不会无限等待：框架最大缓冲消息（max_buffer_messages）会兜底，缓冲满即推送"
       }
     }
   },
