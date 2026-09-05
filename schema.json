@@ -1119,9 +1119,9 @@
   },
   "section_detect": {
     "type": "section",
-    "name": "额外信号开关",
+    "name": "额外防骚扰信号",
     "collapsed": false,
-    "hint": "user_msgs/session_msgs 群聊与私聊各自独立开关（私聊默认关）；bot_speech 仅群聊",
+    "hint": "检测用户刷屏/会话刷屏/bot 自己刷屏等额外骚扰信号群聊与私聊开关（私聊默认关）；bot_speech 仅群聊",
     "fields": {
       "detect_user_msgs": {
         "type": "switch",
@@ -1157,9 +1157,9 @@
   },
   "section_thresholds": {
     "type": "section",
-    "name": "额外信号阈值",
+    "name": "额外防骚扰信号参数",
     "collapsed": true,
-    "hint": "各信号的窗口与阈值（群聊/私聊各自独立）",
+    "hint": "各额外信号的窗口、阈值与默认屏蔽时长（群聊/私聊各自独立）",
     "fields": {
       "user_msgs_window_seconds": {
         "type": "float",
