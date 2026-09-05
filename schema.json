@@ -629,8 +629,8 @@
       "merge_window_seconds": {
         "type": "float",
         "name": "消息合并间隔顺延（秒）",
-        "default": 0,
-        "hint": "消息在框架 buffer 层合并时启用防抖重置：buffer 内最后一条消息到达后 N 秒无新消息才 flush 成批次送 LLM，期间新消息到达则重置倒计时重新等待。0=自动：取框架最大消息合并间隔（bot_config.bot.max_message_interval，默认 2s）。不会无限等待：框架最大缓冲消息（max_buffer_messages）会兜底"
+        "default": -1,
+        "hint": "消息在框架 buffer 层合并时启用防抖重置：buffer 内最后一条消息到达后 N 秒无新消息才 flush 成批次送 LLM，期间新消息到达则重置倒计时重新等待。-1=自动取框架值并启用顺延；0=不启用顺延（按 WebUI 设定走一次固定间隔）；>0=自定义秒数。不会无限等待：框架最大缓冲消息（max_buffer_messages）会兜底"
       }
     }
   },
