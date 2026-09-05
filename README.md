@@ -1,4 +1,4 @@
-# KiraAI_sustained_chat_plugin/可持续聊天 v2.4.7
+# KiraAI_sustained_chat_plugin/可持续聊天 v2.4.8
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI_sustained_chat_plugin)
 
@@ -347,12 +347,16 @@ croniter>=1.3.0
 
 ## 📝 版本信息
 
-- 当前版本：v2.4.7
+- 当前版本：v2.4.8
 - 兼容 KiraAI：v2.29.6+（插件图标需 v2.30.0+）
 - 作者：KiraAI + znq19
 
 <details>
 <summary>更新日志</summary>
+
+### v2.4.8
+
+- **修复非唤醒消息不重置顺延**：之前 merge_window_seconds 顺延只被唤醒消息重置，非唤醒消息（receive_unmentioned）到达后计时器不重置——导致顺延形同"首条唤醒消息后固定 N 秒"。现在非唤醒消息也会重置计时器，真正实现"最后一条消息到达后 N 秒无新消息才 flush"
 
 ### v2.4.7
 

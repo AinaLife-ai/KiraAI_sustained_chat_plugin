@@ -1115,6 +1115,10 @@ class DebouncePlugin(BasePlugin):
                 if buffer.get_length() >= self.max_unmentioned_messages:
                     buffer.pop(count=buffer.get_length()-self.max_unmentioned_messages+1)
                 event.buffer()
+                # 顺延进行中：非唤醒消息也重置计时器（最后一条消息到达后 N 秒无新消息才 flush）
+                # 仅在已有顺延任务时 set——不主动启动（非唤醒不触发开窗）
+                if sid in self.session_events and sid in self.session_tasks:
+                    self.session_events[sid].set()
                 if self.group_proactive_chat and event.is_group_message() \
                         and not self.enhance.dormant.in_dormant(self.enhance._now_hhmm(), sid) \
                         and self._is_proactive_allowed(sid):
