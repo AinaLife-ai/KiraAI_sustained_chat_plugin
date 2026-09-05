@@ -1,4 +1,4 @@
-# KiraAI_sustained_chat_plugin/可持续聊天 v2.4.9
+# KiraAI_sustained_chat_plugin/可持续聊天 v2.5.1
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI_sustained_chat_plugin)
 
@@ -347,12 +347,27 @@ croniter>=1.3.0
 
 ## 📝 版本信息
 
-- 当前版本：v2.4.9
+- 当前版本：v2.5.1
 - 兼容 KiraAI：v2.29.6+（插件图标需 v2.30.0+）
 - 作者：KiraAI + znq19
 
 <details>
 <summary>更新日志</summary>
+
+### v2.5.1
+
+- **修复空消息无限重开循环**：`sustain_retry_on_empty` / `dm_retry_on_empty` 开启时，AI 空消息**不再无条件重开窗口**——改为先检查评分（含 bot 本次回复扣分后），**评分不足阈值 → 停止窗口**，评分达标才重开等评分补上再触发
+- **背景**：持续对话概率=1 时，空消息 + 评分不足（1:1 对话下评分恒低）会造成"空消息→重开窗口→下条必命中→又空消息"的无限循环（日志连续次数无限累加）
+- **验证**：评分 12 → bot 空回复 -5 → 7≥5 重开 ✓；评分 6 → bot 空回复 -5 → 1<5 停止 ✓
+- 窗口超时逻辑复核无影响（群聊 `_end_sustain_window` / 私聊 `_dm_sustain_loop` 正常）
+
+### v2.5.0
+
+- **顺延误触发修复**：非唤醒消息只在**批次已开启**（有真唤醒/持续命中）时才重置顺延计时器；无唤醒来历的非唤醒消息只作为前文缓冲，绝不启动顺延/flush
+- **flush 保险丝**：`_debounce_loop` flush 前校验批次唤醒来历，无唤醒来历跳过 flush（前文保留等下次真唤醒）
+- **评分/概率/k_prob 判定全链路日志**：`[Enhance] 评分补正(...)`（deny 抑制 / boost 补触发 / 清零，info 级）+ 持续判定/积极概率/私聊判定的"概率×k_prob→有效概率、随机值、评分门"（debug 级）
+- **poke 屏蔽拦截**：被屏蔽用户的戳一戳事件不进 LLM（poke 单屏蔽只挡戳，不拉黑普通消息）
+- **manage_ignore duration 动态提示**：工具参数描述中的默认时长取自当前配置真实值（不写死）
 
 ### v2.4.9
 
