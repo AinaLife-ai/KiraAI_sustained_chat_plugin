@@ -139,6 +139,18 @@ class DebouncePlugin(BasePlugin):
         bot_cfg = ctx.config["bot_config"].get("bot", {})
         self.debounce_interval = _safe_float(bot_cfg.get("max_message_interval"), 1.5)
         self.max_buffer_messages = _safe_int(bot_cfg.get("max_buffer_messages"), 3)
+        # 消息合并间隔顺延：从 section_queue_merge 读取
+        _qm = cfg.get("section_queue_merge", {}) or {}
+        _mws = _qm.get("merge_window_seconds", -1)
+        if _mws is None or _mws == -1:
+            # -1 = 自动取框架值启用顺延
+            self.merge_window_seconds = self.debounce_interval
+        elif _mws == 0:
+            # 0 = 不启用顺延（按框架默认走一次固定间隔）
+            self.merge_window_seconds = 0
+        else:
+            # >0 = 自定义顺延秒数
+            self.merge_window_seconds = float(_mws)
 
         # 群聊持续状态
         self.sustain_until = defaultdict(float)
@@ -1127,10 +1139,23 @@ class DebouncePlugin(BasePlugin):
             while True:
                 await event.wait()
                 event.clear()
-                try:
-                    await asyncio.sleep(self.debounce_interval)
-                except asyncio.CancelledError:
-                    break
+                if self.merge_window_seconds > 0:
+                    # 消息合并间隔顺延：新消息到达时重置计时器
+                    remaining = self.merge_window_seconds
+                    while remaining > 0:
+                        try:
+                            await asyncio.wait_for(event.wait(), timeout=remaining)
+                            event.clear()
+                            remaining = self.merge_window_seconds
+                        except asyncio.TimeoutError:
+                            break
+                else:
+                    # 0 = 不启用顺延，固定间隔 flush（框架原行为）
+                    try:
+                        await asyncio.sleep(self.debounce_interval)
+                    except asyncio.CancelledError:
+                        break
+                        break
                 if event.is_set() and not self.receive_unmentioned:
                     continue
                 buffer_len = self.ctx.message_processor.get_session_buffer_length(sid)
