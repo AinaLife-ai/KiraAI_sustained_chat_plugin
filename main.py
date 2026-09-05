@@ -613,6 +613,11 @@ class DebouncePlugin(BasePlugin):
         尚未 flush）仍需凭它在批次入口拦截；由下次真实唤醒统一清空。
         """
         self._clear_sustain_state(sid)
+        # 撤销在途批次：停窗后仍在顺延等待中的"命中批次"不再 flush（消息留在
+        # 前文缓冲等下次真唤醒；_debounce_loop 保险丝见 batch_started 已清则跳过 flush）。
+        # 注意：已满即推（event.flush() 已执行）的批次不在此列，消息已发出无法回收。
+        self.batch_started.pop(sid, None)
+        self.batch_count.pop(sid, None)
         self.sustain_stopped[sid] = True
         dropped = await self.merge_scheduler.drop_sustain_pending(sid, self.sustain_hit_ids.get(sid))
         if dropped:
