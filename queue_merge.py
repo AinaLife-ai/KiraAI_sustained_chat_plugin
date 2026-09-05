@@ -50,15 +50,6 @@ class BatchMergeScheduler:
         sec = plugin_cfg.get("section_queue_merge", {})
         self.enabled = sec.get("enabled", True)
         self.max_merge_seconds = float(sec.get("max_merge_seconds", 0))
-        # 合并窗口顺延（防抖重置）：最后一条消息到达后 N 秒无新消息 → 合并推送；
-        # 期间新消息到达 → 窗口重置再等 N 秒（把突发合并完再 flush）。
-        # 0/空 = 自动：取框架"最大消息合并间隔"（bot_config.bot.max_message_interval，
-        # WebUI 显示为 Message Merge Interval，默认 2s）；填值则按该值。
-        merge_window_cfg = sec.get("merge_window_seconds", 0)
-        if merge_window_cfg and float(merge_window_cfg) > 0:
-            self.merge_window_seconds = float(merge_window_cfg)
-        else:
-            self.merge_window_seconds = float(bot_cfg.get("max_message_interval", 1.5))
         self.max_merge_batches_limit = int(sec.get("max_merge_batches_limit", 0))
         self.max_merge_messages = int(sec.get("max_merge_messages", -1))
         self.max_merge_est_tokens = int(sec.get("max_merge_est_tokens", 0))

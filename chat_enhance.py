@@ -293,7 +293,11 @@ class HarassDetector:
             # -1 = 永久屏蔽（工具描述约定）
             until = float("inf")
         else:
-            if duration <= 0:
+            # allow_bot_duration=False：bot 不允许自设时长，强制用默认时长
+            # （配置语义：仅允许使用默认屏蔽时长，忽略 bot 建议值）
+            if not conf.get("allow_bot_duration", True):
+                duration = conf.get("default_duration", 180)
+            elif duration <= 0:
                 duration = conf.get("default_duration", 180)
             if conf.get("allow_bot_duration", True) and conf.get("max_duration", 0) > 0:
                 duration = min(duration, conf["max_duration"])
@@ -311,7 +315,12 @@ class HarassDetector:
             scope_txt = f"session {sid}, all users"
         else:
             scope_txt = f"user {user_id} in {sid}"
-        return f"已屏蔽 {scope_txt} 的 {kind} 唤醒 {duration} 秒"
+        # -1 = 永久（until=inf），返回文本显示"永久"避免误导
+        if duration < 0:
+            dur_txt = "永久"
+        else:
+            dur_txt = f"{duration} 秒"
+        return f"已屏蔽 {scope_txt} 的 {kind} 唤醒 {dur_txt}"
 
     def apply_ignore_from_tag(self, sid: str, kind: str, value: str) -> str:
         """解析 XML tag 值：user|duration:N / all|duration:N / none。"""
