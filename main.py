@@ -1385,10 +1385,22 @@ class DebouncePlugin(BasePlugin):
 
                     if should_stop:
                         if stop_reason == "空消息" and self.dm_retry_on_empty:
-                            # 空 msg 只是"这次不回"：重新开窗，评分补上时再给一次触发机会
-                            # （不结束本轮，不重置主动次数）
-                            self._start_dm_sustain_window(sid)
-                            logger.debug(f"[DM Sustain] 私聊 {sid} AI 空消息（dm_retry_on_empty），重开窗口等评分补上")
+                            # 空 msg 只是"这次不回"：评分达标才重开窗口等评分补上再触发；
+                            # 评分不足则结束本轮（防空消息无限重开循环）
+                            try:
+                                presence = self.enhance._get_presence(is_dm=True)
+                                _score = presence.score(sid, time.time())
+                                _threshold = presence.score_threshold
+                            except Exception:
+                                _score, _threshold = 0.0, 0.0
+                            if _threshold > 0 and _score < _threshold:
+                                logger.debug(
+                                    f"[DM Sustain] 私聊 {sid} AI 空消息但评分不足({_score:.1f}<{_threshold:.0f})，结束本轮"
+                                )
+                                self._clear_dm_sustain_state(sid)
+                            else:
+                                self._start_dm_sustain_window(sid)
+                                logger.debug(f"[DM Sustain] 私聊 {sid} AI 空消息（dm_retry_on_empty），重开窗口等评分补上")
                         elif self.dm_sustain_mode == "per_retry" and self.dm_retry_on_ai_stop:
                             # 视为失败，重试或取消（不重置主动次数）
                             self._handle_dm_failure(sid, f"AI {stop_reason}")
@@ -1409,10 +1421,23 @@ class DebouncePlugin(BasePlugin):
             should_stop = False
             if self.stop_on_ai_empty and self._is_empty_msg(ai_text):
                 if self.sustain_retry_on_empty:
-                    # 空 msg 只是"这次不回"：重新开窗，评分补上时再给一次触发机会
+                    # 空 msg 只是"这次不回"：评分达标才重开窗口等评分补上再触发；
+                    # 评分不足则停止窗口（防概率=1 时空消息无限重开循环）
                     # （不调用 _stop_sustain_round，不 drop pending，窗口继续）
                     # 清空旧 hit_ids，避免陈旧 id 把后续真实唤醒批次误判为纯持续命中
                     self.sustain_hit_ids.pop(sid, None)
+                    try:
+                        presence = self.enhance._get_presence(is_dm=False)
+                        _score = presence.score(sid, time.time())
+                        _threshold = presence.score_threshold
+                    except Exception:
+                        _score, _threshold = 0.0, 0.0
+                    if _threshold > 0 and _score < _threshold:
+                        await self._stop_sustain_round(sid)
+                        logger.debug(
+                            f"[Sustain] 群 {sid} AI 空消息但评分不足({_score:.1f}<{_threshold:.0f})，停止窗口"
+                        )
+                        return
                     self._start_sustain_window(sid)
                     logger.debug(f"[Sustain] 群 {sid} AI 空消息（retry_on_empty），重开窗口等评分补上")
                     return
