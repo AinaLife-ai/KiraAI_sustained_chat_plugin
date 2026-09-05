@@ -1111,33 +1111,16 @@ class DebouncePlugin(BasePlugin):
         # === 消息缓冲逻辑 ===
         if not event.is_mentioned:
             if self.receive_unmentioned:
-                _buffer = self.ctx.get_buffer(str(event.session))
-                # 裁剪只弹"非唤醒"消息（唤醒消息是触发 LLM 的核心，绝不能被裁剪丢弃）。
-                # 用 SessionBuffer.pop 从最老开始逐个弹，跳过唤醒消息，直到非唤醒数 ≤ 上限。
-                if _buffer.get_length() >= self.max_unmentioned_messages:
-                    _keep = self.max_unmentioned_messages
-                    _dropped = 0
-                    while True:
-                        _evts = getattr(_buffer, "buffer", None)
-                        if not _evts:
-                            break
-                        _non_cnt = sum(1 for e in _evts if not getattr(e, "is_mentioned", False))
-                        if _non_cnt <= _keep:
-                            break
-                        # 找到最老的非唤醒消息下标并弹出
-                        _idx = next((i for i, e in enumerate(_evts) if not getattr(e, "is_mentioned", False)), -1)
-                        if _idx < 0:
-                            break
-                        del _evts[_idx]
-                        _dropped += 1
-                    if _dropped:
-                        logger.debug(
-                            f"[Debounce] 非唤醒消息裁剪 {_dropped} 条（唤醒消息不受影响）: {sid}"
-                        )
+                buffer = self.ctx.get_buffer(str(event.session))
+                # 裁剪：维持非唤醒消息上限（原版逻辑，弹最老——满即推保证唤醒消息
+                # 在 buffer 到 max_buffer_messages 前就随批次送出，裁剪实际难以触发，
+                # 弹最老的只是"唤醒之外的额外上文"非唤醒消息）
+                if buffer.get_length() >= self.max_unmentioned_messages:
+                    buffer.pop(count=buffer.get_length()-self.max_unmentioned_messages+1)
                 event.buffer()
-                # 容量安全阀：buffer 达到最大缓冲消息数时立即 flush（框架不自动 flush，
-                # 非唤醒消息大量涌入时若只重置顺延会导致消息滞留/被裁剪丢弃）
-                # 注意：event.buffer() 只是设置策略，本条消息实际入 buffer 在框架执行策略后，
+                # 满即推（max_buffer_messages 容量控制，原版只在唤醒分支检查，
+                # 顺延场景下非唤醒只重置计时器导致消息滞留——现所有消息到达都检查）：
+                # event.buffer() 只是设置策略，本条消息实际入 buffer 在框架执行策略后，
                 # 故用 _blen + 1 >= max_buffer_messages（含本条）判断
                 if self.max_buffer_messages > 0:
                     _blen = self.ctx.message_processor.get_session_buffer_length(sid)
