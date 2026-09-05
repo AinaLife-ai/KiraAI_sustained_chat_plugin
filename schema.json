@@ -26,7 +26,7 @@
       "merge_window_seconds": {
         "type": "float",
         "name": "消息合并间隔顺延（秒）",
-        "default": -1,
+        "default": 0,
         "hint": "新消息到达重置倒计时。-1=自动获取webui设置值；0=不启用；>0=自定义秒数"
       },
       "group_chat_prompt": {
