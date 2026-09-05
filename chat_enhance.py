@@ -293,7 +293,11 @@ class HarassDetector:
             # -1 = 永久屏蔽（工具描述约定）
             until = float("inf")
         else:
-            if duration <= 0:
+            # allow_bot_duration=False：bot 不允许自设时长，强制用默认时长
+            # （配置语义：仅允许使用默认屏蔽时长，忽略 bot 建议值）
+            if not conf.get("allow_bot_duration", True):
+                duration = conf.get("default_duration", 180)
+            elif duration <= 0:
                 duration = conf.get("default_duration", 180)
             if conf.get("allow_bot_duration", True) and conf.get("max_duration", 0) > 0:
                 duration = min(duration, conf["max_duration"])
