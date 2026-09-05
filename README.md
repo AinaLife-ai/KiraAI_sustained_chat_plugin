@@ -1,4 +1,4 @@
-# KiraAI_sustained_chat_plugin/可持续聊天 v2.4.8
+# KiraAI_sustained_chat_plugin/可持续聊天 v2.4.9
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI_sustained_chat_plugin)
 
@@ -347,12 +347,17 @@ croniter>=1.3.0
 
 ## 📝 版本信息
 
-- 当前版本：v2.4.8
+- 当前版本：v2.4.9
 - 兼容 KiraAI：v2.29.6+（插件图标需 v2.30.0+）
 - 作者：KiraAI + znq19
 
 <details>
 <summary>更新日志</summary>
+
+### v2.4.9
+
+- **修复非唤醒消息裁剪丢失唤醒消息**：buffer 满（max_unmentioned_messages）时旧逻辑直接弹最老消息，会把唤醒消息一并弹掉（用户实测"导员1111"被丢弃）。现裁剪只弹非唤醒消息，唤醒消息永不被裁剪
+- **顺延容量安全阀**：buffer 达到 max_buffer_messages 时立即 flush（框架 SessionBuffer 不自动 flush），避免顺延期间消息无限积压/被裁剪丢弃
 
 ### v2.4.8
 
