@@ -1111,22 +1111,21 @@ class DebouncePlugin(BasePlugin):
         # === 消息缓冲逻辑 ===
         if not event.is_mentioned:
             if self.receive_unmentioned:
-                buffer = self.ctx.get_buffer(str(event.session))
-                # 裁剪：维持非唤醒消息上限（原版逻辑，弹最老——满即推保证唤醒消息
-                # 在 buffer 到 max_buffer_messages 前就随批次送出，裁剪实际难以触发，
-                # 弹最老的只是"唤醒之外的额外上文"非唤醒消息）
-                if buffer.get_length() >= self.max_unmentioned_messages:
-                    buffer.pop(count=buffer.get_length()-self.max_unmentioned_messages+1)
-                event.buffer()
-                # 满即推（max_buffer_messages 容量控制，原版只在唤醒分支检查，
-                # 顺延场景下非唤醒只重置计时器导致消息滞留——现所有消息到达都检查）：
-                # event.buffer() 只是设置策略，本条消息实际入 buffer 在框架执行策略后，
-                # 故用 _blen + 1 >= max_buffer_messages（含本条）判断
+                # 满即推优先（max_buffer_messages 总量控制，所有消息到达都检查）：
+                # 必须【先】于裁剪判断——裁剪会把 buffer 压回 max_unmentioned 条，
+                # 若先裁剪则满即推永远不触发（与原版 bug 相同：消息滞留/被裁剪弹掉）。
+                # 注意：event.buffer() 只是设置策略，本条消息实际入 buffer 在框架执行策略后，
+                # 故用 _blen + 1 >= max_buffer_messages（含本条）判断。
                 if self.max_buffer_messages > 0:
                     _blen = self.ctx.message_processor.get_session_buffer_length(sid)
                     if _blen + 1 >= self.max_buffer_messages:
                         event.flush()
                         return
+                # 未满即推才裁剪（维持非唤醒消息上限，弹最老的"唤醒之外额外上文"）
+                buffer = self.ctx.get_buffer(str(event.session))
+                if buffer.get_length() >= self.max_unmentioned_messages:
+                    buffer.pop(count=buffer.get_length()-self.max_unmentioned_messages+1)
+                event.buffer()
                 # 顺延进行中：非唤醒消息也重置计时器（最后一条消息到达后 N 秒无新消息才 flush）
                 # 仅在已有顺延任务时 set——不主动启动（非唤醒不触发开窗）
                 if sid in self.session_events and sid in self.session_tasks:
