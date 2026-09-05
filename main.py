@@ -139,9 +139,9 @@ class DebouncePlugin(BasePlugin):
         bot_cfg = ctx.config["bot_config"].get("bot", {})
         self.debounce_interval = _safe_float(bot_cfg.get("max_message_interval"), 1.5)
         self.max_buffer_messages = _safe_int(bot_cfg.get("max_buffer_messages"), 3)
-        # 消息合并间隔顺延：从 section_queue_merge 读取
-        _qm = cfg.get("section_queue_merge", {}) or {}
-        _mws = _qm.get("merge_window_seconds", -1)
+        # 消息合并间隔顺延：从 section_basic 读取
+        _basic = cfg.get("section_basic", {}) or {}
+        _mws = _basic.get("merge_window_seconds", -1)
         if _mws is None or _mws == -1:
             # -1 = 自动取框架值启用顺延
             self.merge_window_seconds = self.debounce_interval

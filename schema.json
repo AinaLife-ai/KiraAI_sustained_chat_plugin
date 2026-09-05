@@ -23,6 +23,12 @@
         "minimum": 1,
         "hint": "缓冲区中最多保留多少条非唤醒消息作为上下文"
       },
+      "merge_window_seconds": {
+        "type": "float",
+        "name": "消息合并间隔顺延（秒）",
+        "default": -1,
+        "hint": "buffer 层防抖重置：新消息到达重置倒计时。-1=自动取框架值；0=不启用；>0=自定义秒数"
+      },
       "group_chat_prompt": {
         "name": "群聊额外提示词",
         "type": "markdown",
@@ -625,12 +631,6 @@
         "type": "switch",
         "default": false,
         "hint": "开启后打印队列合并调试日志（放行/拦截/软合并/超时合并/拆批等决策），便于排查"
-      },
-      "merge_window_seconds": {
-        "type": "float",
-        "name": "消息合并间隔顺延（秒）",
-        "default": -1,
-        "hint": "消息在框架 buffer 层合并时启用防抖重置：buffer 内最后一条消息到达后 N 秒无新消息才 flush 成批次送 LLM，期间新消息到达则重置倒计时重新等待。-1=自动取框架值并启用顺延；0=不启用顺延（按 WebUI 设定走一次固定间隔）；>0=自定义秒数。不会无限等待：框架最大缓冲消息（max_buffer_messages）会兜底"
       }
     }
   },
