@@ -26,8 +26,8 @@
       "merge_window_seconds": {
         "type": "float",
         "name": "消息合并间隔顺延（秒）",
-        "default": 0,
-        "hint": "新消息到达重置倒计时。-1=自动获取webui设置值；0=不启用；>0=自定义秒数"
+        "default": -1,
+        "hint": "消息合并间隔顺延（buffer 防抖重置）：最后一条消息到达后 N 秒无新消息才 flush 成批次送 LLM，期间新消息到达重置倒计时。-1=自动取 WebUI 设置值并启用顺延；0=不启用顺延（按 WebUI 固定间隔）；>0=自定义秒数。不会无限等待：框架最大缓冲消息（max_buffer_messages）会兜底"
       },
       "group_chat_prompt": {
         "name": "群聊额外提示词",
@@ -78,6 +78,12 @@
         "type": "switch",
         "default": true,
         "hint": "群聊主动概率是否受 k_prob 调节系数影响（回少提高/回多降低）"
+      },
+      "debug_log_enabled": {
+        "type": "switch",
+        "name": "顺延调试日志",
+        "default": false,
+        "hint": "开启后，merge_window_seconds 触发消息合并顺延（新消息重置计时器/flush 时）打印调试日志，便于排查合并时机"
       }
     }
   },

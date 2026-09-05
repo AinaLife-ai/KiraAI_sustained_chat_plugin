@@ -151,6 +151,8 @@ class DebouncePlugin(BasePlugin):
         else:
             # >0 = 自定义顺延秒数
             self.merge_window_seconds = float(_mws)
+        # 顺延调试日志：section_basic.debug_log_enabled（独立开关，默认关）
+        self._merge_debug = _basic.get("debug_log_enabled", False)
 
         # 群聊持续状态
         self.sustain_until = defaultdict(float)
@@ -1141,11 +1143,15 @@ class DebouncePlugin(BasePlugin):
                 event.clear()
                 if self.merge_window_seconds > 0:
                     # 消息合并间隔顺延：新消息到达时重置计时器
+                    if self._merge_debug:
+                        logger.info(f"[Debounce] 顺延开始 session={sid}, 窗口={self.merge_window_seconds}s")
                     remaining = self.merge_window_seconds
                     while remaining > 0:
                         try:
                             await asyncio.wait_for(event.wait(), timeout=remaining)
                             event.clear()
+                            if self._merge_debug:
+                                logger.info(f"[Debounce] 顺延重置 session={sid}（新消息到达，重新等待 {self.merge_window_seconds}s）")
                             remaining = self.merge_window_seconds
                         except asyncio.TimeoutError:
                             break
@@ -1161,6 +1167,8 @@ class DebouncePlugin(BasePlugin):
                 buffer_len = self.ctx.message_processor.get_session_buffer_length(sid)
                 if buffer_len == 0:
                     continue
+                if self._merge_debug:
+                    logger.info(f"[Debounce] 顺延结束 session={sid}（{self.merge_window_seconds}s 无新消息），flush {buffer_len} 条")
                 try:
                     await self.ctx.message_processor.flush_session_messages(sid)
                 except Exception:
