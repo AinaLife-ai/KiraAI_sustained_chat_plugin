@@ -462,13 +462,21 @@ class DebouncePlugin(BasePlugin):
         if action == "unblock":
             if target_type == "all":
                 return "请指定要解除的用户或会话"
-            return self.enhance.harass.unblock(sid, target_id, block_type)
+            result = self.enhance.harass.unblock(sid, target_id, block_type)
+            logger.info(f"[Enhance] 解除屏蔽(工具): {target_type} {target_id} {block_type} → {result}")
+            return result
         # block
         if target_type == "all":
-            return self.enhance.harass.apply_ignore("*", "*", block_type, duration)
+            result = self.enhance.harass.apply_ignore("*", "*", block_type, duration)
+            logger.info(f"[Enhance] 屏蔽(工具): all {block_type} {duration}s → {result}")
+            return result
         if target_type == "session":
-            return self.enhance.harass.apply_ignore(sid, "*", block_type, duration)
-        return self.enhance.harass.apply_ignore(sid, target_id, block_type, duration)
+            result = self.enhance.harass.apply_ignore(sid, "*", block_type, duration)
+            logger.info(f"[Enhance] 屏蔽(工具): session {sid} {block_type} {duration}s → {result}")
+            return result
+        result = self.enhance.harass.apply_ignore(sid, target_id, block_type, duration)
+        logger.info(f"[Enhance] 屏蔽(工具): user {target_id} {block_type} {duration}s → {result}")
+        return result
 
     def _is_empty_msg(self, xml: str) -> bool:
         pattern = r'^\s*<msg\s*/>\s*$|^\s*<msg>\s*</msg>\s*$'
