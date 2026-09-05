@@ -1127,10 +1127,16 @@ class DebouncePlugin(BasePlugin):
             while True:
                 await event.wait()
                 event.clear()
-                try:
-                    await asyncio.sleep(self.debounce_interval)
-                except asyncio.CancelledError:
-                    break
+                # 防抖重置：新消息到达时重置计时器
+                remaining = self.debounce_interval
+                while remaining > 0:
+                    try:
+                        await asyncio.wait_for(event.wait(), timeout=remaining)
+                        # 新消息到达：重置计时器
+                        event.clear()
+                        remaining = self.debounce_interval
+                    except asyncio.TimeoutError:
+                        break
                 if event.is_set() and not self.receive_unmentioned:
                     continue
                 buffer_len = self.ctx.message_processor.get_session_buffer_length(sid)
