@@ -865,17 +865,33 @@ class ChatEnhanceEngine:
             return prob_hit
         score = presence.score(sid, now)
         # 闲时加分：静默超该会话历史平均 × idle_bonus_ratio 时 +idle_bonus
+        idle_added = 0.0
         if presence.idle_bonus > 0 and presence.idle_bonus_ok(sid, now):
             score += presence.idle_bonus
+            idle_added = presence.idle_bonus
         if prob_hit and score < presence.score_threshold:
             # 概率命中 + 评分不足 → deny 开启时拦下
             if deny:
+                logger.info(
+                    f"[Enhance] 评分补正({scope}{'|DM' if is_dm else ''} {sid}): "
+                    f"概率命中但评分不足 → 抑制触发 deny=on "
+                    f"(评分 {score:.1f}{f'(含闲时+{idle_added:.0f})' if idle_added else ''} < 阈值 {presence.score_threshold:.0f})"
+                )
                 return False
         if score >= presence.score_threshold:
             # 评分够 → boost 开启时（或 deny+boost 同时开）触发并清零
             if boost:
                 presence.consume_score(sid)
+                logger.info(
+                    f"[Enhance] 评分补正({scope}{'|DM' if is_dm else ''} {sid}): "
+                    f"评分达标 → 补触发 boost=on（概率未命中也算）"
+                    f"(评分 {score:.1f}{f'(含闲时+{idle_added:.0f})' if idle_added else ''} ≥ 阈值 {presence.score_threshold:.0f}，已清零)"
+                )
                 return True
+        logger.debug(
+            f"[Enhance] 评分补正({scope}{'|DM' if is_dm else ''} {sid}): "
+            f"评分不介入结果（概率命中={prob_hit}，评分 {score:.1f}，阈值 {presence.score_threshold:.0f}）"
+        )
         return prob_hit
 
     def _score_gate_flags(self, scope: str) -> tuple[bool, bool]:

@@ -361,6 +361,35 @@ class DebouncePlugin(BasePlugin):
             return sid not in self.dm_denied_users
         return True
 
+    def _update_tool_hint(self, req):
+        """动态更新 manage_ignore 工具描述：把 duration 默认时长从配置读出（不写死）。
+
+        框架在 ON_LLM_REQUEST 钩子后会重新 request.tools = tool_set.to_list()，
+        因此修改工具实例的参数描述会真实生效；实例被 tool_mgr 持有，配置热重载
+        后每次请求自动反映最新值。
+        """
+        try:
+            tool_set = getattr(req, "tool_set", None)
+            if not tool_set:
+                return
+            tool = tool_set.get("manage_ignore")
+            if tool is None:
+                return
+            try:
+                default_d = self.enhance.harass._conf.get("poke", {}).get("default_duration", 180)
+            except Exception:
+                default_d = 180
+            params = getattr(tool, "parameters", None)
+            if not isinstance(params, dict):
+                return
+            dur = params.get("properties", {}).get("duration")
+            if isinstance(dur, dict):
+                dur["description"] = (
+                    f"屏蔽时长（秒）。留空/0=用默认时长（当前配置 {default_d} 秒）；-1 表示永久"
+                )
+        except Exception:
+            pass
+
     def _filter_tools(self, tool_set, blacklist: List[str], mode: str):
         """按黑名单过滤 ToolSet。
 
@@ -687,10 +716,19 @@ class DebouncePlugin(BasePlugin):
             return
         # 存在感节流：概率 × k_prob（回少提高/回多降低）+ 评分补正
         _dm_prob = self.dm_sustain_reply_probability
+        _kf = 1.0
         if self.dm_k_prob_enabled:
-            _dm_prob *= self.enhance.k_prob(sid, is_dm=True)
+            _kf = self.enhance.k_prob(sid, is_dm=True)
+            _dm_prob *= _kf
         _dm_hit = rand_val < _dm_prob
-        if self.enhance.score_gate(sid, _dm_hit, scope="dm_sustain", is_dm=True):
+        _gate = self.enhance.score_gate(sid, _dm_hit, scope="dm_sustain", is_dm=True)
+        logger.debug(
+            f"[DM Sustain] 私聊 {sid} 持续判定: 概率 {self.dm_sustain_reply_probability:.2f}"
+            f"{'×k_prob ' + f'{_kf:.2f}' if self.dm_k_prob_enabled else ''}"
+            f"→ 有效 {_dm_prob:.3f}, 随机 {rand_val:.3f}, 概率命中={_dm_hit}, "
+            f"评分门={_gate} → {'触发' if _gate else '未命中'}"
+        )
+        if _gate:
             self.dm_sustain_count[sid] += 1
             count = self.dm_sustain_count[sid]
             # 成功发送后重置重试计数（保留主动次数）
@@ -944,6 +982,17 @@ class DebouncePlugin(BasePlugin):
         except Exception:
             pass
 
+        # === poke 屏蔽拦截：poke 单独屏蔽不拉黑普通消息（is_blocked 跳过 poke），
+        #     但戳一戳事件本身要精确拦截：被屏蔽用户的 poke 事件不进 LLM ===
+        try:
+            if self.enhance._detect_kind(event) == "poke" and \
+               self.enhance.harass.is_ignored(_sid, _uid, "poke", time.time()):
+                logger.debug(f"[Enhance] poke屏蔽拦截: {_sid} 用户 {_uid} 的戳一戳不进 LLM")
+                event.discard()
+                return
+        except Exception:
+            pass
+
         # 唤醒词检测（区分真 @ 与唤醒词命中：框架在循环前已标记真 @）
         _was_mentioned = bool(getattr(event, "is_mentioned", False))
         for m in event.message.chain:
@@ -1058,10 +1107,21 @@ class DebouncePlugin(BasePlugin):
                             logger.debug(f"[Sustain] 群 {sid} 休眠期内不介入（per_message）")
                         else:
                             _sustain_prob = self.sustain_reply_probability
+                            _k_factor = 1.0
                             if self.sustain_k_prob_enabled:
-                                _sustain_prob *= self.enhance.k_prob(sid)
-                            _sustain_hit = random.random() < _sustain_prob
-                            if self.enhance.score_gate(sid, _sustain_hit, scope="sustain"):
+                                _k_factor = self.enhance.k_prob(sid)
+                                _sustain_prob *= _k_factor
+                            _rand = random.random()
+                            _sustain_hit = _rand < _sustain_prob
+                            _gate = self.enhance.score_gate(sid, _sustain_hit, scope="sustain")
+                            logger.debug(
+                                f"[Sustain] 群 {sid} 持续判定(per_message): "
+                                f"概率 {self.sustain_reply_probability:.2f}"
+                                f"{'×k_prob ' + f'{_k_factor:.2f}' if self.sustain_k_prob_enabled else ''}"
+                                f"→ 有效 {_sustain_prob:.3f}, 随机 {_rand:.3f}, 概率命中={_sustain_hit}, "
+                                f"评分门={_gate} → {'命中' if _gate else '未命中'}"
+                            )
+                            if _gate:
                                 event.message.is_mentioned = True
                                 self.sustain_count[sid] += 1
                                 _mid = getattr(event.message, "message_id", None)
@@ -1090,10 +1150,21 @@ class DebouncePlugin(BasePlugin):
                             else:
                                 # 存在感节流：概率 × k_prob + 评分补正
                                 _sustain_prob = self.sustain_reply_probability
+                                _k_factor = 1.0
                                 if self.sustain_k_prob_enabled:
-                                    _sustain_prob *= self.enhance.k_prob(sid)
-                                _sustain_hit = random.random() < _sustain_prob
-                                if self.enhance.score_gate(sid, _sustain_hit, scope="sustain"):
+                                    _k_factor = self.enhance.k_prob(sid)
+                                    _sustain_prob *= _k_factor
+                                _rand = random.random()
+                                _sustain_hit = _rand < _sustain_prob
+                                _gate = self.enhance.score_gate(sid, _sustain_hit, scope="sustain")
+                                logger.debug(
+                                    f"[Sustain] 群 {sid} 持续判定(per_round): "
+                                    f"概率 {self.sustain_reply_probability:.2f}"
+                                    f"{'×k_prob ' + f'{_k_factor:.2f}' if self.sustain_k_prob_enabled else ''}"
+                                    f"→ 有效 {_sustain_prob:.3f}, 随机 {_rand:.3f}, 概率命中={_sustain_hit}, "
+                                    f"评分门={_gate} → {'命中' if _gate else '未命中'}"
+                                )
+                                if _gate:
                                     event.message.is_mentioned = True
                                     self.sustain_count[sid] += 1
                                     _mid = getattr(event.message, "message_id", None)
@@ -1141,18 +1212,30 @@ class DebouncePlugin(BasePlugin):
                         self.batch_count.pop(sid, None)
                         return
                 # 顺延进行中：非唤醒消息也重置计时器（最后一条消息到达后 N 秒无新消息才 flush）
-                if sid in self.session_events and sid in self.session_tasks:
+                # —— 仅当批次已开启（有唤醒/命中）时才允许重置顺延：无唤醒来历的非唤醒
+                #    消息绝不能启动顺延/flush（否则开了次 LLM 后所有围观消息都进批次）
+                if _batch_on and sid in self.session_events and sid in self.session_tasks:
                     self.session_events[sid].set()
                 if self.group_proactive_chat and event.is_group_message() \
                         and not self.enhance.dormant.in_dormant(self.enhance._now_hhmm(), sid) \
                         and self._is_proactive_allowed(sid):
                     # 存在感节流：概率 × k_prob（回少提高/回多降低）
                     prob = self.group_proactive_chat_probability
+                    _kf = 1.0
                     if self.proactive_k_prob_enabled:
-                        prob *= self.enhance.k_prob(sid)
-                    prob_hit = random.random() < prob
+                        _kf = self.enhance.k_prob(sid)
+                        prob *= _kf
+                    _rand = random.random()
+                    prob_hit = _rand < prob
+                    _gate = self.enhance.score_gate(sid, prob_hit)
+                    logger.debug(
+                        f"[Sustain] 群 {sid} 积极概率判定: 概率 {self.group_proactive_chat_probability:.2f}"
+                        f"{'×k_prob ' + f'{_kf:.2f}' if self.proactive_k_prob_enabled else ''}"
+                        f"→ 有效 {prob:.3f}, 随机 {_rand:.3f}, 概率命中={prob_hit}, "
+                        f"评分门={_gate} → {'触发' if _gate else '未触发'}"
+                    )
                     # 评分补正：评分不足概率命中作废；评分够概率未命中补触发
-                    if self.enhance.score_gate(sid, prob_hit):
+                    if _gate:
                         logger.info("[Chat] Triggered proactive chat")
                         event.flush()
             else:
@@ -1220,6 +1303,14 @@ class DebouncePlugin(BasePlugin):
                     continue
                 buffer_len = self.ctx.message_processor.get_session_buffer_length(sid)
                 if buffer_len == 0:
+                    continue
+                # 保险丝：flush 只发生在"批次由唤醒/持续命中开启"时；无唤醒来历
+                # （纯围观消息）不 flush，只留作前文等下次真唤醒。防任何路径误触发。
+                if not self.batch_started.get(sid, False):
+                    if self._merge_debug:
+                        logger.debug(
+                            f"[Debounce] 未检测到唤醒来历批次，跳过 flush（前文保留）: {sid}"
+                        )
                     continue
                 if self._merge_debug:
                     logger.info(f"[Debounce] 顺延结束 session={sid}（{self.merge_window_seconds}s 无新消息），flush {buffer_len} 条")
@@ -1368,6 +1459,9 @@ class DebouncePlugin(BasePlugin):
     async def filter_proactive_tools(self, event: KiraMessageBatchEvent, req: LLMRequest, *_):
         # 聊天增强引擎：注入合并通知（骚扰/唤醒/存在感状态）
         self.enhance.on_llm_request(event, req)
+
+        # 动态工期说明：manage_ignore 的 duration 默认值取自当前配置（不写死）
+        self._update_tool_hint(req)
 
         # 主动屏蔽工具开关：关闭时从 tool_set 移除 manage_ignore（bot 不再能主动屏蔽）
         if not self.enable_manage_ignore:
