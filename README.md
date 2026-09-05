@@ -1,4 +1,4 @@
-# KiraAI_sustained_chat_plugin/可持续聊天 v2.5.1
+# KiraAI_sustained_chat_plugin/可持续聊天 v2.5.2
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI_sustained_chat_plugin)
 
@@ -347,12 +347,19 @@ croniter>=1.3.0
 
 ## 📝 版本信息
 
-- 当前版本：v2.5.1
+- 当前版本：v2.5.2
 - 兼容 KiraAI：v2.29.6+（插件图标需 v2.30.0+）
 - 作者：KiraAI + znq19
 
 <details>
 <summary>更新日志</summary>
+
+### v2.5.2
+
+- **停窗撤销在途批次**：`_stop_sustain_round`（空消息/停止词/达上限停窗）现在会清理 batch_started/batch_count——仍在顺延等待中的"持续命中批次"不再被 flush（保险丝拦截），消息留在前文缓冲等下次真唤醒/概率命中时随前文一起送出
+- **背景**：持续命中 → 空消息停止 → 顺延到点的时序下，已命中的消息会被"补刀"再次送进 LLM（空回复循环的余波）；修复后停止语义彻底——bot 闭口后不再误触发
+- **安全性**：只清插件侧批次状态，不碰框架 session buffer——消息不丢（前文保留）、不卡回复（保险丝轻量拦截）、不影响真唤醒/满即推/队列合并（drop_sustain_pending 管 QueueMerge 层，本修复管 _debounce_loop 层，双层互补）
+- **验证**：命中→停止→顺延到点 flush=0（被拦）；真唤醒后前文（含被撤销消息）完整带出
 
 ### v2.5.1
 
