@@ -716,6 +716,8 @@ class ChatEnhanceEngine:
         self.dm_session_msgs_threshold = _safe_int(cfg.get("dm_session_msgs_threshold"), 20)
         self.bot_speech_window = _safe_float(cfg.get("bot_speech_window_seconds"), 300)
         self.bot_speech_threshold = _safe_int(cfg.get("bot_speech_threshold"), 10)
+        # 额外信号默认屏蔽时长（通知里建议 bot 使用的 duration；独立于各骚扰类别的 default_duration）
+        self.extra_default_duration = _safe_int(cfg.get("extra_default_duration"), 180)
         self._extra_counts: dict[str, dict[str, deque]] = defaultdict(
             lambda: {k: deque(maxlen=512) for k in ("bot_speech", "user_msgs", "session_msgs")}
         )
@@ -773,8 +775,7 @@ class ChatEnhanceEngine:
         """
         label = {"user_msgs": f"user {user_id} sent", "session_msgs": "this session received",
                  "bot_speech": "you spoke"}[kind]
-        conf = self.harass._conf.get(kind) or self.harass._conf.get("poke", {})
-        dur = conf.get("default_duration", 180) or 180
+        dur = self.extra_default_duration
         return (
             f"[System: {label} {n} messages in {int(window)}s (threshold {threshold}). "
             f"Reply with <ignore>user:{user_id}|type:{kind}|duration:{dur}</ignore> to block "

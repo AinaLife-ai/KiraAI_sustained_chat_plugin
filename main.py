@@ -239,7 +239,8 @@ class DebouncePlugin(BasePlugin):
                    "session_msgs_window_seconds", "session_msgs_threshold",
                    "bot_speech_window_seconds", "bot_speech_threshold",
                    "dm_user_msgs_window_seconds", "dm_user_msgs_threshold",
-                   "dm_session_msgs_window_seconds", "dm_session_msgs_threshold"):
+                   "dm_session_msgs_window_seconds", "dm_session_msgs_threshold",
+                   "extra_default_duration"):
             if _k in _th:
                 _enhance_cfg[_k] = _th[_k]
         self.enhance = ChatEnhanceEngine(ctx, _enhance_cfg, self, merge_seconds=self.debounce_interval)

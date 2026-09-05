@@ -1210,6 +1210,12 @@
         "type": "integer",
         "name": "会话消息阈值（私聊）",
         "default": 20
+      },
+      "extra_default_duration": {
+        "type": "integer",
+        "name": "额外信号默认屏蔽时长（秒）",
+        "default": 180,
+        "hint": "user_msgs/session_msgs/bot_speech 触发后通知里建议 bot 使用的屏蔽时长（独立于各骚扰类别的默认时长）"
       }
     }
   }
