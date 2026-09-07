@@ -1,9 +1,9 @@
 {
   "display_name": "Sustained Chat 可持续聊天",
   "plugin_id": "sustained-chat",
-  "version": "2.5.7",
+  "version": "2.5.8",
   "author": "KiraAI+znq19",
-  "description": "基于原版 Default Chat 优化积压队列、非唤醒消息识别和增加持续回复、主动回复功能的聊天增强插件。v2.5.7: 媒体管线重构——Image/Sticker 元素保留（Plus-One 表情包复读兼容）+ 官方格式 caption 预置 + PIR 自动互斥 + 原生多模态不截断。",
+  "description": "s: 媒体管线 v2.5.7 的修复——非唤醒媒体仅唤醒识别时 caption=\"\" 提前到 handle_msg 阶段，阻止框架渲染时自动 VLM 白跑（3 处 _media_skip 同步设 caption）。",
   "repo": "https://github.com/znq19/KiraAI_sustained_chat_plugin",
   "core_version": ">=2.29.6",
   "icon": "icon.png"
