@@ -1,10 +1,21 @@
-# KiraAI_sustained_chat_plugin/可持续聊天 v2.5.6
+# KiraAI_sustained_chat_plugin/可持续聊天 v2.5.7
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI_sustained_chat_plugin)
 
 # — 让 AI 真“主动”起来
 
 > 这不是一个普通的聊天优化插件，而是一套完整的“社交主动性引擎”。
+
+v2.5.7 媒体管线重构（与 **Plus-One 复读插件**完美兼容 + 官方格式对齐）：
+- **Image/Sticker 元素不再替换删除**——表情包元素保留 → Plus-One 能正确复读表情包；图片元素保留 → 纯图片消息天然不参与复读。识别结果通过预置官方 `caption` 表达，渲染为官方 `[Image 描述, file_path: ...]` / `[Sticker 描述]`（表情包增强附带 file_path）。
+- **仅唤醒识别/媒体预处理完整保留**：非唤醒媒体预置空 caption（官方空占位 `[Image , file_path: ...]` / `[Sticker ]`），零 VLM 调用、LLM 仍知道有媒体；唤醒消息才并行 VLM/STT。
+- **PIR 自动互斥**（默认开）：检测到并行识图插件自动禁用，图片识别完全由本插件接管。
+- **原生多模态不截断**：`max_images_per_message` 在 native 模式下自动跳过（图片全直传，框架压缩控制 token），转发/语音策略照旧。
+- **native 超限占位**：native 模式超限图片替换为 `[Image attached]` 占位拦直传（省 token，LLM 仍知道有图）；Sticker 永不占位（复读优先）。
+- **唤醒消息图片上限**（`max_images_per_message_mentioned`，默认 0 = 不限制）：唤醒消息超限图片同样占位省 token。
+- **native 仅唤醒识别生效**：仅唤醒开时非唤醒图片占位拦直传、唤醒图片保留直传（LLM 直接看图）。
+- **native 表情包跟随仅唤醒**（`native_sticker_follow_mention`，默认开，受上级仅唤醒开关门控）：非唤醒表情包占位 `[Sticker attached]` 省 token；注意开启后 Plus-One 复读表情包会不正确（复读占位文本），酌情关闭以保复读。
+- 群聊提示词默认文案同步迁移为官方占位符格式（仅替换两个字样，安全原子写回）。
 
 想象一下：你的 AI 不再是只会被动回答的机器，而是会主动找你聊天、在群聊中自然接话、甚至定时关心你的数字伙伴。
 

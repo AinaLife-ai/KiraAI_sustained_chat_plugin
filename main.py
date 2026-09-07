@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import io
+import json
 import os
 import random
 import re
@@ -43,15 +44,55 @@ except ImportError:
 
 
 class DebouncePlugin(BasePlugin):
+    def _migrate_group_prompt(self, cfg: dict):
+        """v2.5.7 媒体占位文案迁移：把群聊提示词里的旧字样 [图片]/[动画表情] 安全替换为
+        官方格式 [Image , file_path: ...]/[Sticker ]（与框架 message_format_to_text 渲染
+        及本插件新媒体识别管线对齐；其余文字一字不动）。
+
+        只替换这两个字样（str.replace，不触及其他任何字符/标点/换行），用户自定义
+        提示词同样受益（文案是提示词语义的一部分，识别后官方格式与旧字样不匹配）。
+        通过 cfg 内 config_version 标记确保只迁一次（原子写回：先序列化生成字符串，
+        写入 .tmp 再 os.replace，任何异常都不清空原配置文件）。
+        """
+        if cfg.get("config_version", 1) >= 3:
+            return
+        changed = False
+        for _sec in ("section_basic",):
+            _sec_cfg = cfg.get(_sec, {}) or {}
+            _fields = _sec_cfg.get("fields", _sec_cfg) if isinstance(_sec_cfg, dict) else {}
+            if isinstance(_fields, dict):
+                _p = _fields.get("group_chat_prompt")
+                if isinstance(_p, str) and ("[图片]" in _p or "[动画表情]" in _p):
+                    _fields["group_chat_prompt"] = (
+                        _p.replace("[动画表情]", "[Sticker ]").replace("[图片]", "[Image , file_path: ...]")
+                    )
+                    changed = True
+        cfg["config_version"] = 3
+        if changed:
+            logger.info("[Debounce] 检测到旧版群聊提示词媒体占位符，已迁移为官方格式（config_version=3）")
+            try:
+                from core.utils.path_utils import get_config_path
+                _cfg_path = get_config_path() / "plugins" / "sustained-chat.json"
+                if _cfg_path.parent.exists():
+                    _content = json.dumps(cfg, indent=4, ensure_ascii=False)
+                    _tmp = _cfg_path.with_suffix(".json.tmp")
+                    with open(_tmp, "w", encoding="utf-8") as f:
+                        f.write(_content)
+                    _tmp.replace(_cfg_path)
+                    logger.info(f"[Debounce] 迁移配置已写回: {_cfg_path}")
+            except Exception as e:
+                logger.warning(f"[Debounce] 迁移写回配置文件失败（不影响本次运行）: {e}")
+
     def __init__(self, ctx, cfg: dict):
         super().__init__(ctx, cfg)
+        self._migrate_group_prompt(cfg)
 
         # ========== 从 section_basic 读取基础配置 ==========
         basic = cfg.get("section_basic", {})
         self.waking_words = basic.get("waking_words", [])
         self.receive_unmentioned = basic.get("receive_unmentioned", True)
         self.max_unmentioned_messages = _safe_int(basic.get("max_unmentioned_messages"), 5)
-        self.group_chat_prompt = basic.get("group_chat_prompt", '### 群聊环境说明\r\n\r\n当前为群聊环境，你需要聚焦于**和你有直接关联**或**你十分感兴趣**的消息，对于仅显示为[动画表情]或[图片]的消息不用互动，注意不要刷屏，可以选择不回复任何消息，直接输出<msg/>即可。\r\n\r\n## 消息感知\r\n\r\n你可能会同时收到多条消息，请根据上下文自主决策该回复哪些消息，注意不要刷屏，也可以选择不回复任何消息，直接输出<msg/>即可。\r\n你可以使用 <reasoning>reasoning_content</reasoning> 的标签格式来输出推理内容放在整个输出的最前面，用于推理应该回复哪些消息，回复语气，回复条数，消息分段情况等。\r\n<reasoning>标签和<msg>标签同级，**禁止**将次标签放到<msg>标签内。\r\n**符合以上规则的情况下**确保你想发的聊天消息在<text>标签内，不要遗漏。\r\n')
+        self.group_chat_prompt = basic.get("group_chat_prompt", '### 群聊环境说明\r\n\r\n当前为群聊环境，你需要聚焦于**和你有直接关联**或**你十分感兴趣**的消息，对于仅显示为[Sticker ]或[Image , file_path: ...]的消息不用互动，注意不要刷屏，可以选择不回复任何消息，直接输出<msg/>即可。\r\n\r\n## 消息感知\r\n\r\n你可能会同时收到多条消息，请根据上下文自主决策该回复哪些消息，注意不要刷屏，也可以选择不回复任何消息，直接输出<msg/>即可。\r\n你可以使用 <reasoning>reasoning_content</reasoning> 的标签格式来输出推理内容放在整个输出的最前面，用于推理应该回复哪些消息，回复语气，回复条数，消息分段情况等。\r\n<reasoning>标签和<msg>标签同级，**禁止**将次标签放到<msg>标签内。\r\n**符合以上规则的情况下**确保你想发的聊天消息在<text>标签内，不要遗漏。\r\n')
         self.group_proactive_chat = basic.get("group_proactive_chat", False)
         self.group_proactive_chat_probability = _safe_float(basic.get("group_proactive_chat_probability"), 0.1)
         self.proactive_k_prob_enabled = basic.get("proactive_k_prob_enabled", True)
@@ -68,6 +109,12 @@ class DebouncePlugin(BasePlugin):
         self.image_recognition_only_on_mention = media.get("image_recognition_only_on_mention", False)
         self.image_recognition_probability = _safe_float(media.get("image_recognition_probability"), 1.0)
         self.max_images_per_message = _safe_int(media.get("max_images_per_message"), 3)
+        # 唤醒消息图片上限（默认 0 = 不限制）：唤醒消息超限图片同样 _media_skip 占位省 token
+        self.max_images_per_message_mentioned = _safe_int(media.get("max_images_per_message_mentioned"), 0)
+        # 原生多模态下表情包是否跟随"仅唤醒识别"控制（默认开；需上级 image_recognition_only_on_mention
+        # 开启才生效——上级没开则表情包始终保留直传）。开启后非唤醒表情包占位省 token，
+        # 但 Plus-One 复读表情包会不正确（复读占位文本），hint 已提示酌情开启。
+        self.native_sticker_follow_mention = bool(media.get("native_sticker_follow_mention", True))
         self.forward_recognition_only_on_mention = media.get("forward_recognition_only_on_mention", True)
         self.voice_recognition_only_on_mention = media.get("voice_recognition_only_on_mention", False)
         self.voice_private_need_mention = media.get("voice_private_need_mention", False)
@@ -1050,6 +1097,9 @@ class DebouncePlugin(BasePlugin):
             self._process_media(event.message.chain, is_mentioned, is_private=False)
             if not is_mentioned and not self.image_recognition_only_on_mention:
                 self._limit_media_count(event.message.chain, self.max_images_per_message)
+            elif is_mentioned and self.max_images_per_message_mentioned > 0:
+                # 唤醒消息：仅当配置了唤醒上限（>0）才截断，超限图片 _media_skip 占位省 token
+                self._limit_media_count(event.message.chain, self.max_images_per_message_mentioned)
         else:
             is_mentioned = event.is_mentioned
             self._process_media(event.message.chain, is_mentioned, is_private=True)
@@ -1718,48 +1768,105 @@ class DebouncePlugin(BasePlugin):
         return duration
 
     def _process_media(self, chain, is_mentioned: bool, is_private: bool = False):
+        """处理消息链中的图片、动画表情、合并转发消息和语音。
+
+        v2.5.7 变更（复读兼容 + 官方格式对齐，与 media_recognize v2.3.2 配套）：
+        - Image/Sticker **不再替换为 [图片]/[动画表情] 占位**——元素保留在 chain 中
+          （Plus-One 复读表情包依赖 Sticker 元素；图片元素保留则纯图片消息天然不参与
+          复读）。"本次不识别"通过给元素打 _media_skip 标记表达，由 media_recognize
+          stage1 预置 caption=""（官方空占位 + 阻止框架自动 VLM），识别/不识别与
+          复读判定完全解耦。
+        - 原生多模态模式（image_recognition.mode=native）：图片/表情包完全交给框架
+          原生直传（官方压缩 + token 优化），本函数对它们不做任何处理（不标记、不
+          占位）；转发/语音策略不受模式影响（转发占位 + 唤醒识别 / 语音 STT 照旧）。
+        """
+        if self.media_recognizer._native_mode():
+            # 原生多模态："仅唤醒识别"同样生效——唤醒消息图片保留直传（LLM 直接看图，
+            # 这是 native 的"识别"形态）；非唤醒图片替换为 [Image attached] 占位
+            # （拦直传省 token，LLM 仍知道有图）。
+            # 表情包（Sticker）：默认保留直传（复读真表情包优先——native 下元素在 chain
+            # 即被框架直传，"占位"与"复读真表情包"物理互斥）。若 native_sticker_follow_mention
+            # 开启（且上级仅唤醒识别开启），非唤醒表情包也替换 [Sticker attached] 占位
+            # 省 token——代价是 Plus-One 复读表情包不正确（复读占位文本），hint 已提示。
+            # 转发/语音策略照旧（转发占位 + 唤醒识别 / 语音 STT）。
+            for i, elem in enumerate(chain.message_list):
+                if isinstance(elem, Image):
+                    if self.image_recognition_only_on_mention and not is_mentioned:
+                        chain.message_list[i] = Text("[Image attached]")
+                elif isinstance(elem, Sticker):
+                    if (self.image_recognition_only_on_mention and self.native_sticker_follow_mention
+                            and not is_mentioned):
+                        chain.message_list[i] = Text("[Sticker attached]")
+                elif isinstance(elem, Forward):
+                    if self.forward_recognition_only_on_mention and not is_mentioned:
+                        chain.message_list[i] = Text("[转发消息]")
+                elif isinstance(elem, Record):
+                    self._process_record(elem, chain, i, is_mentioned, is_private)
+                elif isinstance(elem, Reply) and elem.chain:
+                    self._process_media(elem.chain, is_mentioned, is_private)
+            return
+
         for i, elem in enumerate(chain.message_list):
             if isinstance(elem, (Image, Sticker)):
                 if is_mentioned:
                     continue
                 if self.image_recognition_only_on_mention:
-                    chain.message_list[i] = Text("[图片]" if isinstance(elem, Image) else "[动画表情]")
+                    # 非唤醒：不识别（省 VLM），元素保留 → 官方空占位 [Image , file_path: p] / [Sticker ]
+                    elem._media_skip = True
                 else:
                     if random.random() >= self.image_recognition_probability:
-                        chain.message_list[i] = Text("[图片]" if isinstance(elem, Image) else "[动画表情]")
+                        elem._media_skip = True
             elif isinstance(elem, Forward):
                 # only_on_mention=True：仅唤醒消息保留转发；False：全部保留
                 if self.forward_recognition_only_on_mention and not is_mentioned:
                     chain.message_list[i] = Text("[转发消息]")
             elif isinstance(elem, Record):
-                duration = self._get_record_duration(elem)
-                if self.voice_max_duration > 0 and duration > self.voice_max_duration:
-                    chain.message_list[i] = Text(f"[长语音 {duration}秒]")
-                    continue
-                should_try_stt = False
-                if is_private:
-                    if self.voice_private_need_mention:
-                        should_try_stt = is_mentioned
-                    else:
-                        should_try_stt = True
-                else:
-                    if self.voice_recognition_only_on_mention:
-                        should_try_stt = is_mentioned
-                    else:
-                        should_try_stt = True
-                if should_try_stt:
-                    pass
-                else:
-                    chain.message_list[i] = Text("[语音]")
+                self._process_record(elem, chain, i, is_mentioned, is_private)
             elif isinstance(elem, Reply) and elem.chain:
                 self._process_media(elem.chain, is_mentioned, is_private)
 
-    def _limit_media_count(self, chain, max_count: int):
-        if self.image_recognition_only_on_mention:
+    def _process_record(self, elem, chain, i: int, is_mentioned: bool, is_private: bool):
+        """语音处理（_process_media 与原生多模态路径共用）：长语音限长 + STT 策略 + 占位。"""
+        duration = self._get_record_duration(elem)
+        if self.voice_max_duration > 0 and duration > self.voice_max_duration:
+            chain.message_list[i] = Text(f"[长语音 {duration}秒]")
             return
+        should_try_stt = False
+        if is_private:
+            if self.voice_private_need_mention:
+                should_try_stt = is_mentioned
+            else:
+                should_try_stt = True
+        else:
+            if self.voice_recognition_only_on_mention:
+                should_try_stt = is_mentioned
+            else:
+                should_try_stt = True
+        if should_try_stt:
+            pass  # 保留原始语音元素，由 media_recognize stage1 → stage2 并行 STT（限流+缓存）
+        else:
+            chain.message_list[i] = Text("[语音]")
+
+    def _limit_media_count(self, chain, max_count: int):
+        """单条消息媒体数量限制：超出部分不识别（省 VLM/token），元素保留 → 复读不受影响。
+
+        - vlm 模式：超限 Image/Sticker 标记 _media_skip（官方空占位 [Image , file_path: ...] / [Sticker ]）
+        - native 模式：超限 Image 替换为 [Image attached] 占位 Text（拦直传省 token，LLM 仍知道有图）；
+          Sticker 永不占位（复读表情包依赖元素，且直传 token 极小）
+        """
         media_indices = [i for i, e in enumerate(chain.message_list) if isinstance(e, (Image, Sticker))]
         if len(media_indices) <= max_count:
             return
+        if self.media_recognizer._native_mode():
+            # native：超限 Image 替换为官方占位 [Image attached]；超限 Sticker 仅在
+            # native_sticker_follow_mention 开启时占位（[Sticker attached]，代价是复读
+            # 不正确），否则保留（复读真表情包优先）
+            for idx in reversed(media_indices[max_count:]):
+                elem = chain.message_list[idx]
+                if isinstance(elem, Image):
+                    chain.message_list[idx] = Text("[Image attached]")
+                elif self.native_sticker_follow_mention:
+                    chain.message_list[idx] = Text("[Sticker attached]")
+            return
         for idx in reversed(media_indices[max_count:]):
-            elem = chain.message_list[idx]
-            chain.message_list[idx] = Text("[图片]" if isinstance(elem, Image) else "[动画表情]")
+            chain.message_list[idx]._media_skip = True
