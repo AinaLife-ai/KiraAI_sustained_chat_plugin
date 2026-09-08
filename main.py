@@ -43,6 +43,9 @@ except ImportError:
     logger.warning("croniter not installed, cron schedule disabled")
 
 
+_SELF_PLUGIN_ID = "sustained-chat"
+
+
 class DebouncePlugin(BasePlugin):
     def _migrate_group_prompt(self, cfg: dict):
         """v2.5.7 媒体占位文案迁移：把群聊提示词里的旧字样 [图片]/[动画表情] 安全替换为
@@ -321,24 +324,112 @@ class DebouncePlugin(BasePlugin):
 
         # 启动聊天增强引擎（存在感/骚扰/休眠/通知合并）
         self.enhance.start()
-        # 接管互斥：检测独立防骚扰插件是否已加载，已加载则提示停用（本插件内置同能力）
+        # 接管互斥：检测功能重叠的插件并自动停用，避免重复处理（延迟翻倍/重复通知）
+        #   1) default-chat（框架内置默认聊天）：与本插件同为 IM 消息合并实现，
+        #      同时启用会双重防抖/buffer，顺延延迟翻倍、批次计数错乱；且其唤醒词
+        #      语义与本插件冲突 → 停用前先把唤醒词迁移过来（见 _migrate_waking_words_from）。
+        #   2) anti-harass（独立防骚扰）：本插件已内置完整骚扰屏蔽能力 → 直接停用。
         try:
             _pm = self.ctx.plugin_mgr
             if _pm is not None:
-                _loaded = set()
+                _loaded = {}
                 try:
                     # 框架 PluginManager 无 get_loaded_plugin_ids，用 list_plugins 取 plugin_id
                     _infos = _pm.list_plugins() if hasattr(_pm, "list_plugins") else []
-                    _loaded = set(getattr(i, "plugin_id", "") for i in (_infos or []))
+                    for _i in (_infos or []):
+                        _pid = str(getattr(_i, "plugin_id", "") or "")
+                        if _pid:
+                            _loaded[_pid.lower()] = _pid
                 except Exception:
                     pass
-                if any("anti-harass" in str(pid).lower() for pid in _loaded):
-                    logger.warning(
-                        "[Enhance] 检测到独立防骚扰插件已加载，本插件已内置完整骚扰屏蔽能力，"
-                        "建议停用独立防骚扰插件避免重复检测/重复通知"
-                    )
+
+                # ---- default-chat：先迁移唤醒词，再停用 ----
+                _dc_pid = _loaded.get("default-chat")
+                if _dc_pid and _dc_pid != _SELF_PLUGIN_ID:
+                    try:
+                        self._migrate_waking_words_from(_pm, _dc_pid)
+                    except Exception as e:
+                        logger.warning(f"[Debounce] 迁移默认聊天插件唤醒词失败（跳过，不影响运行）: {e}")
+                    try:
+                        await _pm.set_plugin_enabled(_dc_pid, False)
+                        logger.warning(
+                            "[Debounce] 检测到框架内置「默认聊天」插件（default-chat）已加载，"
+                            "本插件已完整接管消息合并与上下文处理，为避免双重防抖/重复处理已自动停用该插件"
+                        )
+                    except Exception as e:
+                        logger.warning(f"[Debounce] 自动停用默认聊天插件失败，请手动停用以避免双重防抖: {e}")
+
+                # ---- anti-harass：直接停用 ----
+                for _pid_lower, _pid in list(_loaded.items()):
+                    if "anti-harass" not in _pid_lower or _pid == _SELF_PLUGIN_ID:
+                        continue
+                    try:
+                        await _pm.set_plugin_enabled(_pid, False)
+                        logger.warning(
+                            "[Enhance] 检测到独立防骚扰插件已加载，本插件已内置完整骚扰屏蔽能力，"
+                            "为避免重复检测/重复通知已自动停用该插件"
+                        )
+                    except Exception as e:
+                        logger.warning(f"[Enhance] 自动停用独立防骚扰插件失败，请手动停用: {e}")
         except Exception:
             pass
+
+    def _migrate_waking_words_from(self, pm, src_pid: str):
+        """首次启用时从框架「默认聊天」插件（default-chat）迁移唤醒词。
+
+        规则（用户约定）：
+          - **仅迁移 `waking_words`**（唤醒词）一项，其余配置（receive_unmentioned /
+            max_unmentioned_messages 等）不迁移——本插件对"非唤醒"有全新语义。
+          - **本插件已填写唤醒词则不迁移**（用户自定义优先，绝不被覆盖），即仅当
+            当前 `waking_words` 为空（默认 []）且来源插件确实有关键词时才搬。
+          - 迁移只发生在内存配置 + 原子写回配置文件，任何异常都不影响本次运行。
+        """
+        try:
+            # 只统计有效词：空串/空白项视为「未填写」，与下方源词过滤口径一致
+            cur = [str(w).strip() for w in (self.waking_words or []) if str(w).strip()]
+        except Exception:
+            cur = []
+        if cur:
+            # 用户已填写唤醒词 → 不迁移（避免覆盖用户配置）
+            return
+        try:
+            src_cfg = pm.get_plugin_config(src_pid) or {}
+        except Exception:
+            return
+        if not isinstance(src_cfg, dict):
+            return
+        src_words = src_cfg.get("waking_words")
+        if not isinstance(src_words, (list, tuple)):
+            return
+        src_words = [str(w).strip() for w in src_words if str(w).strip()]
+        if not src_words:
+            return
+
+        self.waking_words = src_words
+        logger.info(
+            f"[Debounce] 从默认聊天插件迁移唤醒词 {len(src_words)} 个（本插件唤醒词为空，仅迁移关键词）"
+        )
+        # 原子写回配置文件（先写 .tmp 再 replace，失败不影响内存态）
+        try:
+            from core.utils.path_utils import get_config_path
+            _cfg_path = get_config_path() / "plugins" / f"{_SELF_PLUGIN_ID}.json"
+            if not _cfg_path.parent.exists():
+                return
+            _cfg = json.loads(_cfg_path.read_text(encoding="utf-8")) if _cfg_path.exists() else {}
+            if not isinstance(_cfg, dict):
+                _cfg = {}
+            # 持久化格式为扁平 section 键值：{"section_basic": {"waking_words": [...]}}
+            # （框架 _ensure_plugin_config 直接以 field.key 作键写入，无中间 fields 层）
+            _sec = _cfg.get("section_basic")
+            if not isinstance(_sec, dict):
+                _sec = _cfg["section_basic"] = {}
+            _sec["waking_words"] = src_words
+            _tmp = _cfg_path.with_suffix(".json.tmp")
+            _tmp.write_text(json.dumps(_cfg, indent=4, ensure_ascii=False), encoding="utf-8")
+            _tmp.replace(_cfg_path)
+            logger.info(f"[Debounce] 唤醒词迁移已写回: {_cfg_path}")
+        except Exception as e:
+            logger.warning(f"[Debounce] 唤醒词迁移写回失败（内存已生效，不影响本次运行）: {e}")
 
     async def terminate(self):
         for sid, task in list(self.session_tasks.items()):
@@ -1113,6 +1204,16 @@ class DebouncePlugin(BasePlugin):
             if not mentioned_gate:
                 # deny 生效：评分不足时阻止触发，降级为未提及
                 event.is_mentioned = False
+                # P1 修复：_process_media 已按「唤醒」把图片/表情置为待识别（caption=""、
+                # 未打 _media_skip），若此处降级为围观却不回补标记，stage2 仍会对这些
+                # 媒体跑 VLM/STT —— 消息最终不触发 LLM，识别成本全部白付（VLM 泄露）。
+                # 这里按「未唤醒」口径重新处理一遍媒体链，与下面的非唤醒路径保持完全一致。
+                try:
+                    self._process_media(event.message.chain, False, is_private=is_dm)
+                    if not self.image_recognition_only_on_mention:
+                        self._limit_media_count(event.message.chain, self.max_images_per_message)
+                except Exception as e:
+                    logger.warning(f"[Debounce] 评分降级后回补媒体标记失败（可能多跑一次 VLM）: {e}")
 
         # 注意：不在此记录 _last_ignore_sid（旧实现）。ignore/wake_extend tag 是
         # LLM 回复的输出，on_llm_response 已记录本次回复所属会话；handle_msg 里
@@ -1388,7 +1489,6 @@ class DebouncePlugin(BasePlugin):
                     try:
                         await asyncio.sleep(self.debounce_interval)
                     except asyncio.CancelledError:
-                        break
                         break
                 if event.is_set() and not self.receive_unmentioned:
                     continue
