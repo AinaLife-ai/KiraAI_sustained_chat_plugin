@@ -614,10 +614,17 @@ class NoticeMerger:
 
     async def _flush_later(self, sid: str) -> None:
         try:
-            await asyncio.sleep(self._merge_seconds)
-        except asyncio.CancelledError:
-            return
-        self.flush(sid)
+            try:
+                await asyncio.sleep(self._merge_seconds)
+            except asyncio.CancelledError:
+                return
+            self.flush(sid)
+        finally:
+            # B3 修复：任务结束后清理自身引用，避免已完成 Task 对象滞留在
+            # _flush_tasks 中逐个会话累积。仅当槽位仍是「自己」时删除，
+            # 防止误删期间被 submit() 替换成的新任务。
+            if self._flush_tasks.get(sid) is asyncio.current_task():
+                self._flush_tasks.pop(sid, None)
 
     def drain(self, sid: str) -> list:
         """取走并清空挂起通知（on_llm_request 注入用）。"""

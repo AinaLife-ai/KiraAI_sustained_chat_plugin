@@ -1,4 +1,4 @@
-# KiraAI_sustained_chat_plugin/可持续聊天 v2.5.8
+# KiraAI_sustained_chat_plugin/可持续聊天 v2.5.9
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI_sustained_chat_plugin)
 
@@ -6,10 +6,16 @@
 
 > 这不是一个普通的聊天优化插件，而是一套完整的“社交主动性引擎”。
 
+v2.5.9 稳定性与接管完善：
+- **自动接管默认聊天插件**：检测到框架内置 `default-chat` 已加载时，自动停用并**迁移其唤醒词**（仅迁移 `waking_words`，本插件已填写唤醒词则不迁移、不覆盖）。避免两者同时启用造成的双重防抖/buffer（顺延延迟翻倍、批次计数错乱）。独立防骚扰插件（`anti-harass`）同样自动停用。
+- **修复 VLM 泄露**（评分门控降级）：消息被 `proactive_score_gate_deny` 判定为“不触发”而从唤醒降级为围观时，此前已按唤醒口径保留的待识别图片会被继续送 VLM/STT——消息最终不进入 LLM，识别成本全部白付。现在降级时会同步回补非唤醒口径的媒体标记，识别成本为 0。
+- **通知合并任务自清理**：`_flush_later` 结束后主动释放自身引用，避免已完成 Task 对象按会话累积。
+- 清理 `_debounce_loop` 中的重复 `break` 死代码。
+
 v2.5.7 媒体管线重构（与 **Plus-One 复读插件**完美兼容 + 官方格式对齐）：
 - **Image/Sticker 元素不再替换删除**——表情包元素保留 → Plus-One 能正确复读表情包；图片元素保留 → 纯图片消息天然不参与复读。识别结果通过预置官方 `caption` 表达，渲染为官方 `[Image 描述, file_path: ...]` / `[Sticker 描述]`（表情包增强附带 file_path）。
 - **仅唤醒识别/媒体预处理完整保留**：非唤醒媒体预置空 caption（官方空占位 `[Image , file_path: ...]` / `[Sticker ]`），零 VLM 调用、LLM 仍知道有媒体；唤醒消息才并行 VLM/STT。
-- **PIR 自动互斥**（默认开）：检测到并行识图插件自动禁用，图片识别完全由本插件接管。
+- **自动互斥接管**（默认开）：检测到并行识图插件（PIR）自动禁用，图片识别完全由本插件接管；同样自动停用框架内置 `default-chat` 与独立 `anti-harass`（详见 v2.5.9 说明）。
 - **原生多模态不截断**：`max_images_per_message` 在 native 模式下自动跳过（图片全直传，框架压缩控制 token），转发/语音策略照旧。
 - **native 超限占位**：native 模式超限图片替换为 `[Image attached]` 占位拦直传（省 token，LLM 仍知道有图）；Sticker 永不占位（复读优先）。
 - **唤醒消息图片上限**（`max_images_per_message_mentioned`，默认 0 = 不限制）：唤醒消息超限图片同样占位省 token。
@@ -326,7 +332,7 @@ croniter>=1.3.0
 
 ## 🚀 快速开始
 
-0. 关闭KiraAI默认聊天插件或其他同类型处理插件
+0. 直接安装即可——本插件会自动检测并停用功能重叠的插件（框架内置 `default-chat`、独立 `anti-harass`）；若 `default-chat` 已配置唤醒词且本插件唤醒词为空，会自动迁移过来（不覆盖你自己填写的唤醒词）
 1. 将本插件文件夹放入 `data/plugins/`
 2. 在 WebUI 插件设置中配置需要的功能
 3. 重启 KiraAI 或禁用/启用插件使配置生效
