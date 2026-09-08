@@ -446,6 +446,8 @@ class ParallelMediaRecognizer:
             coros = []
             for _, media in pending_tasks:
                 for short_id, info in media.items():
+                    # 创建 coro 前就设 _done=True：防并发 stage2 重复建 coro
+                    info["_done"] = True
                     if info["type"] in ("Image", "Sticker"):
                         coros.append(self._describe_one(sess_sid, short_id, info, results, batch_sem=batch_img_sem))
                     else:
