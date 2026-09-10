@@ -664,6 +664,17 @@
         "default": true,
         "hint": "批次媒体（图片VLM/音频STT）到达时并行识别，积压批次排队期间识别完毕；关闭则回退框架串行识别"
       },
+      "rescue_skipped_on_llm": {
+        "name": "进 LLM 时补识别被跳过的媒体",
+        "type": "enum",
+        "options": [
+          "mention",
+          "all",
+          "off"
+        ],
+        "default": "mention",
+        "hint": "跳过决策发生在「还不知道这批会不会进 LLM」的时候（非唤醒不识别/概率识别），此后若这批因主动搭话等原因仍然进了 LLM，模型就会看到空占位（[Image , file_path: p] / [Sticker ]）看不见图。mention=只补「因仅唤醒识别跳过」的（推荐，这批既然要送进 LLM，补识别不算白付）；all=连「概率未中」的也补；off=旧行为不补。注：「超出每消息媒体上限」和 PIR 跳过始终尊重"
+      },
       "max_parallel_images": {
         "name": "每批次最大并行图片数",
         "type": "integer",
