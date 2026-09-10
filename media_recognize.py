@@ -647,17 +647,13 @@ class ParallelMediaRecognizer:
             if self._pir_active() or self._native_mode(sid):
                 return
             media: dict = {}
-            visited: set = set()
             for m in messages:
-                # ① stage1 已登记的待识别媒体（含已被替换掉的 Record 语音）
+                # 只取 stage1 已登记的「待识别」媒体（含已被替换掉的 Record 语音）。
+                # 被显式判定不识别的媒体（仅唤醒识别的非唤醒媒体 / 概率未中 / 超上限）
+                # 不在这里 —— 那是配置要求的省 VLM，预取它等于绕过用户的开关。
                 for k, v in (getattr(m, "_pir_media", None) or {}).items():
                     if isinstance(v, dict) and not v.get("_done") and k not in media:
                         media[k] = v
-                # ② 链上「此前被判定不识别」的媒体（非唤醒 / 概率未中）：
-                #    既然已确定进批次，就该识别 —— 这正是「进批次就识别」
-                await self._collect_skipped_media(
-                    getattr(m, "chain", None), media, visited, sid
-                )
             if not media:
                 return
             pool = self._results_pool.setdefault(sid, {})
@@ -693,51 +689,6 @@ class ParallelMediaRecognizer:
                 elem.caption = desc      # 既阻止框架自动 VLM，又让渲染直接带描述
         except Exception:
             pass
-
-    async def _collect_skipped_media(self, chain, media: dict, visited: set, sid: str) -> None:
-        """收集链上此前被标记「跳过」的媒体（非唤醒 / 概率未中），用于预取。
-
-        尊重：「每消息媒体上限」(_media_skip_reason == "cap") 与 PIR 的 _pir_skip。
-        键与 stage1/stage2 保持一致（优先复用钉在元素上的 _pir_short_id）。
-        """
-        if chain is None:
-            return
-        cid = id(chain)
-        if cid in visited:
-            return
-        visited.add(cid)
-        for elem in chain:
-            if isinstance(elem, (Image, Sticker)):
-                if getattr(elem, "_pir_skip", False):
-                    continue
-                if (getattr(elem, "caption", None) or "").strip():
-                    continue                                   # 已有描述
-                if (getattr(elem, "_media_skip_reason", "") or "") == "cap":
-                    continue                                   # 显式上限：保持空占位
-                key = getattr(elem, "_pir_short_id", None)
-                if key and key in media:
-                    continue
-                try:
-                    md5 = await elem.hash_image()
-                except Exception:
-                    md5 = None
-                if not key:
-                    key = md5[:8] if md5 else f"noid_{id(elem)}"
-                    try:
-                        elem._pir_short_id = key                # 钉住键：stage2/stage3 共用
-                    except Exception:
-                        pass
-                media.setdefault(key, {
-                    "md5": md5,
-                    "elem": elem,
-                    "type": "Sticker" if isinstance(elem, Sticker) else "Image",
-                    "_done": False,
-                })
-            elif isinstance(elem, Reply):
-                await self._collect_skipped_media(getattr(elem, "chain", None), media, visited, sid)
-            elif isinstance(elem, Forward):
-                for sub in (getattr(elem, "chains", None) or []):
-                    await self._collect_skipped_media(sub, media, visited, sid)
 
     async def _describe_one(self, sess_sid: str, media_id: str, info: dict, results: dict,
                             batch_sem: Optional[asyncio.Semaphore] = None):
@@ -960,19 +911,18 @@ class ParallelMediaRecognizer:
                         _cap = getattr(_elem, "caption", None)
                         if _cap is not None and str(_cap).strip():
                             continue            # 已有描述
-                        # PIR 的跳过标记：一律尊重（那是并行识图插件的分工，不是省钱）
+                        # PIR 的跳过标记：一律尊重（并行识图插件的分工）
                         if getattr(_elem, "_pir_skip", False):
                             continue
-                        # 「超出每消息媒体上限」的截断：尊重（防图片轰炸，是显式上限）
-                        if getattr(_elem, "_media_skip_reason", "") == "cap":
+                        # 我方**显式**「不识别」标记，一律尊重：
+                        #   mention     = 仅唤醒识别开启时的非唤醒媒体（用户要省这笔 VLM）
+                        #   probability = 概率未中（用户掷骰子要省）
+                        #   cap         = 超出每消息媒体上限（防图片轰炸）
+                        # 这些保持空占位是**配置的既定代价**，不是 bug，绝不能在这里偷偷补。
+                        # 这里只救「本该识别却没补上」的：没有跳过标记、caption 仍为空
+                        # （stage2 没跑 / md5 键变化 / 批次被第三方插件截断等）。
+                        if getattr(_elem, "_media_skip", False):
                             continue
-                        # 其余「跳过」（非唤醒 / 概率未中）在这里不生效。
-                        #   跳过的唯一目的是「不给不会进 LLM 的围观消息白付 VLM」；
-                        #   而此处是 on_llm_request —— 这批**已经确定要进 LLM**。
-                        #   官方语义就是「进批次的媒体就识别」（框架 render：
-                        #   `if ele.caption is None: desc_img(...)`，内置聊天插件从不碰 media）。
-                        #   若在这里仍留空占位，等于：照付了那几行占位的 input token，
-                        #   却让模型瞎着眼回复 —— 纯亏，没有任何省钱意义。
                         mtype = "Sticker" if isinstance(_elem, Sticker) else "Image"
                         anchor = _anchor_of(_elem, mtype, await self._media_path(_elem))
                         if not any(anchor in t for t in _texts):
