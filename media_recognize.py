@@ -226,10 +226,18 @@ class ParallelMediaRecognizer:
     # ================= 三级并发限流（批次级 + 每会话 + 全局） =================
 
     def _session_sem(self, sems: dict, sid: str, limit: int) -> asyncio.Semaphore:
-        """惰性获取/创建某会话的信号量。"""
+        """惰性获取/创建某会话的信号量。
+
+        与 _round_media 同样做有界清理：会话数很多时（大群 + 众多私聊），信号量字典
+        若无上限会长期缓慢增长。超过 128 个 sid 时按插入顺序淘汰最旧的一半
+        （被淘汰的会话再次出现时会重建信号量，代价可忽略）。
+        """
         sem = sems.get(sid)
         if sem is None:
             sem = asyncio.Semaphore(max(1, limit))
+            if len(sems) > 128:
+                for old_sid in list(sems)[: len(sems) - 64]:
+                    sems.pop(old_sid, None)
             sems[sid] = sem
         return sem
 

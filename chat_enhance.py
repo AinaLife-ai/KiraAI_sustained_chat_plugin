@@ -50,6 +50,28 @@ def _safe_float(v, default: float) -> float:
     except (TypeError, ValueError):
         return default
 
+_NUM_SEP_RE = re.compile(r"[,，;；、\s]+")
+
+
+def _flatten_values(values) -> list:
+    """把「分值」列表拍平成纯数字（字符串）列表。
+
+    WebUI 的分值字段是**标签输入**（TagInput：输入一个按回车加一个标签），正常用法
+    是一个标签一个数字；但用户也可能在一个标签里写成 "10,5" / "10 5" / "10、5"。
+    这里按常见分隔符拆开，避免 `float("10,5")` 失败后静默回退成默认值造成困惑。
+    仅对**分值**做此处理——关键词不拆（词本身可能含空格，如 "iPhone 15"）。
+    """
+    out = []
+    for v in (values or []):
+        if isinstance(v, (int, float)):
+            out.append(v)
+            continue
+        for part in _NUM_SEP_RE.split(str(v).strip()):
+            if part:
+                out.append(part)
+    return out
+
+
 def _pair_keywords(words, values, default_value: float = 5.0) -> list:
     """把「关键词列表」与「分值列表」配对成 [(word, value), ...]。
 
@@ -62,7 +84,7 @@ def _pair_keywords(words, values, default_value: float = 5.0) -> list:
     关键词统一小写做子串匹配（与宿主 _check_stop_keywords / waking_words 口径一致）。
     """
     ws = [str(w).strip().lower() for w in (words or []) if str(w).strip()]
-    vs = [_safe_float(v, default_value) for v in (values or [])]
+    vs = [_safe_float(v, default_value) for v in _flatten_values(values)]
     out = []
     for i, w in enumerate(ws):
         v = (vs[i] if i < len(vs) else vs[-1]) if vs else default_value
