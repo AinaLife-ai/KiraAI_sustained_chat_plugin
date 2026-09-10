@@ -1,10 +1,15 @@
-# KiraAI_sustained_chat_plugin/可持续聊天 v2.5.9
+# KiraAI_sustained_chat_plugin/可持续聊天 v2.5.10
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI_sustained_chat_plugin)
 
 # — 让 AI 真“主动”起来
 
 > 这不是一个普通的聊天优化插件，而是一套完整的“社交主动性引擎”。
+
+v2.5.10 媒体识别修复（“VLM 跑了却看不见图”）：
+- **修复识别结果被静默丢弃**（关键）：框架在批次处理时会先**压缩图片**（`compress_image_element` 置 `media.md5 = None`），渲染时又**重新 `hash_image()`**，导致元素 md5 与 stage1 记录的键不再一致。此前 stage2 从 `elem.md5` 反推查找键 → 查不到 → 识别结果被静默丢弃，LLM 只收到空的 `[Image , file_path: ...]`。现在 stage1 会把键钉在元素上（`_pir_short_id`），stage2 优先使用它；md5 / `noid_` 兜底保留兼容。
+- **修复会话级能力判定分叉**：框架按「会话级生效能力」（`session_mgr.get_effective_capabilities`，会话覆盖优先于全局）解析 `image_recognition.mode` / `desc_prompt`，而此前本插件只读全局 `bot_config`。一旦某会话单独覆盖过配置就会出现：全局 native + 会话 vlm → 我们跳过、框架自己识图；全局 vlm + 会话 native → 我们照常识图而框架走原生直传、**本次 VLM 完全白跑**。现已严格对齐框架口径（VLM 描述词同样跟随会话级 `desc_prompt`）。
+- **识图日志可观测**：VLM 调用此前完全静默，无法与框架自身的识图日志区分。现使用专用日志器 `MediaRecognize`（**紫色**，与框架 `llm` / 并行识图插件 `parallel_vlm` 同款配色），输出与官方同款文案 `Describing image using <model> (<provider>)`。
 
 v2.5.9 稳定性与接管完善：
 - **自动接管默认聊天插件**：检测到框架内置 `default-chat` 已加载时，自动停用并**迁移其唤醒词**（仅迁移 `waking_words`，本插件已填写唤醒词则不迁移、不覆盖）。避免两者同时启用造成的双重防抖/buffer（顺延延迟翻倍、批次计数错乱）。独立防骚扰插件（`anti-harass`）同样自动停用。

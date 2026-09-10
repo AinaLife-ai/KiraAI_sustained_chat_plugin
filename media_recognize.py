@@ -28,11 +28,21 @@ import re
 from io import BytesIO
 from typing import Optional
 
-from core.plugin import logger
 from core.chat.message_utils import KiraMessageEvent, KiraMessageBatchEvent
 from core.chat.message_elements import Text, Image, Sticker, Record, Reply, Forward
 from core.provider import LLMRequest
 from core.utils.common_utils import get_default_vlm_prompt, speech_to_text
+
+# 专用日志器：与框架 core/utils/common_utils.py 的 `get_logger("llm", "purple")`、
+# 以及并行识图插件的 `get_logger("parallel_vlm", "purple")` 保持一致 —— 识图/VLM
+# 相关日志统一紫色，前缀 [MediaRecognize]，便于与框架自身的 desc_img 日志对照。
+# 注意：logger 名字即日志前缀，故消息正文里不再重复写 [MediaRecognize] 标签。
+try:
+    from core.logging_manager import get_logger
+
+    logger = get_logger("MediaRecognize", "purple")
+except Exception:  # 极端兼容：拿不到框架日志器时退回插件 logger
+    from core.plugin import logger
 
 # 标识符匹配（内容三态：空 / 描述 / (未识别) (已过期)）
 _IMAGE_RE = re.compile(r"\[Image #([^\]\s:]+): ([^\]]*)\]")
@@ -104,7 +114,7 @@ class ParallelMediaRecognizer:
     # ================= 调试日志 =================
 
     def _log(self, msg: str):
-        logger.debug(f"[MediaRecognize] {msg}")
+        logger.debug(msg)
 
     def _pir_active(self) -> bool:
         """运行时实时检测并行识图插件（PIR）是否已加载，且未被自动互斥关闭。
@@ -152,26 +162,63 @@ class ParallelMediaRecognizer:
                 except TypeError:
                     pm.set_plugin_enabled("parallel_image_reader", False)
                 logger.info(
-                    "[MediaRecognize] 检测到并行识图插件已启用，已自动禁用（pir_auto_disable，"
+                    "检测到并行识图插件已启用，已自动禁用（pir_auto_disable，"
                     "图片识别由本模块全权接管；如需恢复 PIR 请在 WebUI 关闭本插件的自动互斥开关）"
                 )
         except Exception as e:
-            logger.warning(f"[MediaRecognize] 自动禁用并行识图插件失败（不影响识别）: {type(e).__name__}: {e}")
+            logger.warning(f"自动禁用并行识图插件失败（不影响识别）: {type(e).__name__}: {e}")
 
-    def _native_mode(self) -> bool:
+    def _effective_image_caps(self, sid: Optional[str] = None) -> dict:
+        """解析「会话级生效」的 image_recognition 能力，严格对齐框架行为。
+
+        框架 handle_im_batch_message 用的是：
+            capabilities = session_mgr.get_effective_capabilities(sid, bot_config.capabilities)
+            image_recognition = capabilities.get("image_recognition", {})
+        即**会话级覆盖优先于全局**。此前本模块只读全局
+        `bot_config.capabilities.image_recognition`，一旦某会话用 WebUI 单独覆盖了
+        image_recognition.mode，两边判定就会分叉：
+          · 全局 native + 会话 vlm_description → 我们跳过、caption 保持 None
+            → 框架认为该 VLM 并自行识别（我们的回填逻辑整条失效）；
+          · 全局 vlm_description + 会话 native → 我们照常识别，而框架走原生直传
+            （ele.caption 被覆盖为 "attached image"）→ 本次 VLM 完全白跑。
+        这里按框架口径取有效能力，消除分叉。
+        """
+        try:
+            global_caps = self.ctx.config.get_config("bot_config.capabilities", {}) or {}
+        except Exception:
+            global_caps = {}
+        if not isinstance(global_caps, dict):
+            global_caps = {}
+        caps = global_caps
+        if sid:
+            sm = getattr(self.ctx, "session_mgr", None)
+            if sm is not None and hasattr(sm, "get_effective_capabilities"):
+                try:
+                    eff = sm.get_effective_capabilities(sid, global_caps)
+                    if isinstance(eff, dict):
+                        caps = eff
+                except Exception:
+                    pass
+        ir = caps.get("image_recognition", {}) if isinstance(caps, dict) else {}
+        return ir if isinstance(ir, dict) else {}
+
+    def _native_mode(self, sid: Optional[str] = None) -> bool:
         """运行时实时检测原生多模态模式（KiraAI v2.31.0+）。
 
         与 _pir_active 同理，不做 __init__ 一次性快照：用户可能在 WebUI 直接切换
-        bot_config.capabilities.image_recognition.mode 而不重启 Kira / 重载插件，
-        快照会过时。每次事件实时读取配置（框架配置走内存缓存，微秒级，
-        无卡顿延迟），WebUI 保存后立即生效。
+        image_recognition.mode 而不重启 Kira / 重载插件，快照会过时。每次事件实时
+        读取（框架配置走内存缓存，微秒级），WebUI 保存后立即生效。
+
+        sid 提供时按「会话级生效能力」判定（与框架一致）；未提供时退化为全局配置。
         """
         try:
-            if hasattr(self.ctx, "config") and self.ctx.config is not None:
+            ir = self._effective_image_caps(sid)
+            mode = ir.get("mode")
+            if mode is None:
                 mode = self.ctx.config.get_config(
                     "bot_config.capabilities.image_recognition.mode", "vlm_description"
                 )
-                return str(mode or "").lower() == "native"
+            return str(mode or "").lower() == "native"
         except Exception:
             pass
         return False
@@ -260,9 +307,11 @@ class ParallelMediaRecognizer:
         try:
             self._flatten_forwards(event.message.chain)
             media: dict[str, dict] = {}
+            _sid = getattr(getattr(event, "session", None), "sid", None)
             await self._walk_chain(
                 event.message.chain, media, set(),
                 is_mentioned=bool(getattr(event, "is_mentioned", False)),
+                sid=_sid,
             )
             if media:
                 # 合并而非覆盖：并行识图插件（PIR）可能已先写入 Image 索引，
@@ -270,9 +319,10 @@ class ParallelMediaRecognizer:
                 existing = getattr(event.message, self._media_attr, None) or {}
                 setattr(event.message, self._media_attr, {**existing, **media})
         except Exception:
-            logger.exception("[MediaRecognize] stage1 error")
+            logger.exception("stage1 error")
 
-    async def _walk_chain(self, chain, media: dict, visited: set, is_mentioned: bool = False):
+    async def _walk_chain(self, chain, media: dict, visited: set, is_mentioned: bool = False,
+                          sid: Optional[str] = None):
         """递归遍历 chain（含 Reply.chain / Forward.chains，带环检测）。嵌套 Forward 已拍平。"""
         if chain is None:
             return
@@ -291,7 +341,7 @@ class ParallelMediaRecognizer:
                 # 原生多模态模式（KiraAI v2.31.0+）：元素保留在 chain 中，
                 # 由框架 _build_native_content 收集并直传模型（官方压缩 + 持久化引用）。
                 # 本模块不预置 caption、不识别图片，只做音频 STT。
-                if self._native_mode():
+                if self._native_mode(sid):
                     continue
                 mtype = "Image" if isinstance(elem, Image) else "Sticker"
                 await self._prefill_media(elem, mtype, media)
@@ -300,10 +350,10 @@ class ParallelMediaRecognizer:
                 if replaced is not None:
                     chain[idx] = replaced
             elif isinstance(elem, Reply):
-                await self._walk_chain(getattr(elem, "chain", None), media, visited, is_mentioned)
+                await self._walk_chain(getattr(elem, "chain", None), media, visited, is_mentioned, sid)
             elif isinstance(elem, Forward):
                 for sub in (getattr(elem, "chains", None) or []):
-                    await self._walk_chain(sub, media, visited, is_mentioned)
+                    await self._walk_chain(sub, media, visited, is_mentioned, sid)
 
     async def _prefill_media(self, elem, mtype: str, media: dict):
         """图片/表情包 → 预置 caption（元素保留，不替换、不删除）。
@@ -326,6 +376,14 @@ class ParallelMediaRecognizer:
         except Exception:
             md5 = None
         short_id = md5[:8] if md5 else f"noid_{id(elem)}"
+        # 把本阶段使用的键钉在元素上：框架 handle_im_batch_message 会在渲染前调用
+        # compress_image_element()（media.md5 = None + 换文件），随后 message_format_to_text
+        # 又会重新 hash_image() → 元素 md5 与 stage1 记录的键不再一致；若 stage2 仍从
+        # elem.md5 反推键，就会查不到 results → 识别结果无法合并（VLM 白跑、LLM 看不见图）。
+        try:
+            elem._pir_short_id = short_id
+        except Exception:
+            pass
         if md5:
             desc = await self._cache_get(md5) or ""
             if desc and not self._is_valid_desc(desc):
@@ -358,6 +416,10 @@ class ParallelMediaRecognizer:
         else:
             short_id = f"noid_{id(elem)}"
             desc = ""
+        try:
+            elem._pir_short_id = short_id  # 同 _prefill_media：把键钉在元素上
+        except Exception:
+            pass
         media[short_id] = {"md5": md5, "elem": elem, "type": mtype, "_done": bool(desc)}
         if desc:
             # 缓存命中：直接带 file_path（to_path 幂等，_temp_path 已缓存不重复下载）
@@ -431,7 +493,7 @@ class ParallelMediaRecognizer:
             ]
             pending_tasks = [(m, md) for m, md in pending_tasks if md]
             # 原生多模态模式：图片/表情包已由框架直传模型，stage2 只做音频 STT
-            if self._native_mode():
+            if self._native_mode(sess_sid):
                 pending_tasks = [
                     (m, {k: v for k, v in md.items() if v.get("type") not in ("Image", "Sticker")})
                     for m, md in pending_tasks
@@ -473,7 +535,7 @@ class ParallelMediaRecognizer:
                             message.message_str, results, paths, message.chain)
                     self._fill_chain(message.chain, results, paths)
         except Exception:
-            logger.exception("[MediaRecognize] stage2 error")
+            logger.exception("stage2 error")
 
     def _fill_message_str(self, text: str, results: dict, paths: dict,
                           chain=None) -> str:
@@ -537,10 +599,10 @@ class ParallelMediaRecognizer:
             # 三层限流：批次级 → 会话级 → 全局级（固定获取顺序，无死锁）
             if batch_sem is not None:
                 async with batch_sem, sess_sem, self._global_img_sem:
-                    desc = await asyncio.wait_for(self._describe_image(info["elem"]), self.media_timeout)
+                    desc = await asyncio.wait_for(self._describe_image(info["elem"], sess_sid), self.media_timeout)
             else:
                 async with sess_sem, self._global_img_sem:
-                    desc = await asyncio.wait_for(self._describe_image(info["elem"]), self.media_timeout)
+                    desc = await asyncio.wait_for(self._describe_image(info["elem"], sess_sid), self.media_timeout)
             # 无论成功失败都标记已处理：同一条消息重发不再重复识别（防 429 风暴）
             info["_done"] = True
             if desc and self._is_valid_desc(desc):
@@ -548,11 +610,11 @@ class ParallelMediaRecognizer:
                     await self._cache_set(md5, desc)
                 results[media_id] = desc
             else:
-                logger.warning(f"[MediaRecognize] image VLM returned empty/invalid desc id={media_id} md5={md5[:8] if md5 else 'n/a'}")
+                logger.warning(f"image VLM returned empty/invalid desc id={media_id} md5={md5[:8] if md5 else 'n/a'}")
                 results[media_id] = "(未识别)"
         except Exception as e:
             info["_done"] = True
-            logger.warning(f"[MediaRecognize] image describe failed id={media_id}: {type(e).__name__}: {e}")
+            logger.warning(f"image describe failed id={media_id}: {type(e).__name__}: {e}")
             results[media_id] = "(未识别)"
 
     async def _transcribe_one(self, sess_sid: str, media_id: str, info: dict, results: dict,
@@ -568,7 +630,7 @@ class ParallelMediaRecognizer:
             stt_client = provider_mgr.get_default_stt() if provider_mgr is not None else None
             if stt_client is None:
                 info["_done"] = True
-                logger.warning(f"[MediaRecognize] STT client unavailable (no default STT model) id={media_id}")
+                logger.warning(f"STT client unavailable (no default STT model) id={media_id}")
                 results[media_id] = "(未识别)"
                 return
             sess_sem = self._session_sem(self._session_aud_sems, sess_sid, self.stt_max_parallel_per_session)
@@ -588,31 +650,43 @@ class ParallelMediaRecognizer:
                     await self._cache_set(md5, text)
                 results[media_id] = text
             else:
-                logger.warning(f"[MediaRecognize] STT returned empty/invalid text id={media_id}")
+                logger.warning(f"STT returned empty/invalid text id={media_id}")
                 results[media_id] = "(未识别)"
         except Exception as e:
             info["_done"] = True
-            logger.warning(f"[MediaRecognize] STT failed id={media_id}: {type(e).__name__}: {e}")
+            logger.warning(f"STT failed id={media_id}: {type(e).__name__}: {e}")
             results[media_id] = "(未识别)"
 
-    async def _describe_image(self, elem) -> str:
+    async def _describe_image(self, elem, sid: Optional[str] = None) -> str:
         """图片 VLM：统一 to_data_url → vlm.chat 路径（对齐并行识图插件已验证路径）；
         to_data_url 失败时 fallback 直接 httpx 下载（带 UA + pixiv Referer，覆盖图床防盗链）；
         quality_enabled 时 JPEG 压缩。失败返回 ""（调用方降级为 (未识别) 并打日志）。"""
         try:
             vlm = self.ctx.provider_mgr.get_default_vlm()
             if vlm is None:
-                logger.warning("[MediaRecognize] get_default_vlm() returned None")
+                logger.warning("get_default_vlm() returned None")
                 return ""
+            # 可观测性：框架的 desc_img() 会打 "Describing image using …"，而我们直接
+            # vlm.chat()（绕过了那层包装）→ 成功时不打任何日志，日志里无法分辨一次识图
+            # 是本插件发起还是框架自己发起的。这里补一条**与官方同款文案 + 同款紫色**的
+            # 日志（本模块 logger 名为 "MediaRecognize"、颜色 purple，故前缀即
+            # [MediaRecognize]），便于对照排查（谁在识图、用的是哪个模型）。
+            try:
+                _mdl = vlm.model
+                logger.info(
+                    f"Describing image using {_mdl.model_id} ({_mdl.provider_name})"
+                )
+            except Exception:
+                pass
             data_url = None
             try:
                 data_url = await elem.to_data_url()
             except Exception as e:
-                logger.debug(f"[MediaRecognize] to_data_url failed ({type(e).__name__}), try direct download")
+                logger.debug(f"to_data_url failed ({type(e).__name__}), try direct download")
                 data_url = await self._try_direct_download(elem)
             if not data_url:
                 logger.warning(
-                    f"[MediaRecognize] cannot fetch image data: "
+                    f"cannot fetch image data: "
                     f"file_type={getattr(elem, 'file_type', '?')} "
                     f"file={str(getattr(elem, 'file', ''))[:80]}"
                 )
@@ -620,14 +694,14 @@ class ParallelMediaRecognizer:
             if self.quality_enabled:
                 _, _, b64 = data_url.partition(",")
                 if not b64:
-                    logger.warning("[MediaRecognize] empty base64 after to_data_url")
+                    logger.warning("empty base64 after to_data_url")
                     return ""
                 img = _open_image(base64.b64decode(b64))
                 q = max(10, min(100, self.quality_value))
                 buf = BytesIO()
                 img.save(buf, format="JPEG", quality=q)
                 data_url = f"data:image/jpeg;base64,{base64.b64encode(buf.getvalue()).decode()}"
-            prompt = self._vlm_prompt()
+            prompt = self._vlm_prompt(sid)
             request = LLMRequest(messages=[{
                 "role": "user",
                 "content": [
@@ -638,15 +712,15 @@ class ParallelMediaRecognizer:
             resp = await vlm.chat(request)
             return (resp.text_response or "").strip() if resp else ""
         except Exception as e:
-            logger.warning(f"[MediaRecognize] describe image failed: {type(e).__name__}: {e}")
+            logger.warning(f"describe image failed: {type(e).__name__}: {e}")
             return ""
 
-    def _vlm_prompt(self) -> str:
-        """VLM 描述词：跟随 WebUI 配置 bot_config.capabilities.image_recognition.desc_prompt
-        （对齐框架 message_format_to_text 行为）；未配置/为空时用 locale.lang 语言默认 prompt。"""
+    def _vlm_prompt(self, sid: Optional[str] = None) -> str:
+        """VLM 描述词：跟随 WebUI 配置 image_recognition.desc_prompt（对齐框架
+        message_format_to_text 行为：框架同样从「会话级生效能力」里取 desc_prompt）；
+        未配置/为空时用 locale.lang 语言默认 prompt。"""
         try:
-            caps = self.ctx.config.get_config("bot_config.capabilities.image_recognition", {})
-            desc_prompt = (caps or {}).get("desc_prompt", "") or ""
+            desc_prompt = (self._effective_image_caps(sid).get("desc_prompt") or "") or ""
             if desc_prompt.strip():
                 return desc_prompt.strip()
         except Exception:
@@ -672,7 +746,7 @@ class ParallelMediaRecognizer:
                 if resp.status_code == 200 and resp.content:
                     return "data:image/jpeg;base64," + base64.b64encode(resp.content).decode()
         except Exception as e:
-            logger.debug(f"[MediaRecognize] direct download failed: {type(e).__name__}: {e}")
+            logger.debug(f"direct download failed: {type(e).__name__}: {e}")
         return None
 
     # ================= stage3：历史/残留标识符兜底 =================
@@ -703,7 +777,7 @@ class ParallelMediaRecognizer:
                     # 有原媒体且未识别过 → 现场识别
                     if info["type"] == "Image":
                         # 原生多模态模式：图片不识别，直接标 (未识别) 占位
-                        if self._native_mode():
+                        if self._native_mode(event.sid):
                             results[media_id] = "(未识别)"
                             continue
                         coros.append(self._describe_one(event.sid, media_id, info, results, batch_sem=batch_img_sem))
@@ -730,7 +804,7 @@ class ParallelMediaRecognizer:
                 if new_text != text:
                     p.content = new_text
         except Exception:
-            logger.exception("[MediaRecognize] stage3 error")
+            logger.exception("stage3 error")
         finally:
             # 无论正常/异常/提前 return 都清理本会话暂存媒体索引，防单 sid 无限累积（内存泄漏）。
             # stage2 的 setdefault+update 是同步原子块，pop 后新批次会重建，无并发风险
@@ -760,23 +834,31 @@ class ParallelMediaRecognizer:
         返回 (short_id, desc, path) 供 _fill_official_text 在 message_str 里锚点替换；
         找不到对应 media 时返回 None。
         """
-        md5 = None
-        try:
-            md5 = getattr(elem, "md5", None) or None
-        except Exception:
+        # 键来源优先级：
+        #   1) 元素上由 stage1 钉下的 _pir_short_id —— 最可靠。框架在渲染前会压缩图片
+        #      （media.md5 = None）并在渲染时重新 hash_image()，此时 elem.md5 与 stage1
+        #      记录的键已经不同；若从 md5 反推必然查不到，识别结果会被静默丢弃。
+        #   2) 兼容未打标记的元素（旧数据/其它 code path）：elem.md5 → noid_{id} 兜底。
+        key = getattr(elem, "_pir_short_id", None)
+        desc = results.get(key) if key else None
+        if desc is None:
             md5 = None
-        if not md5:
-            return None
-        short_id = md5[:8]
-        desc = results.get(short_id)
+            try:
+                md5 = getattr(elem, "md5", None) or None
+            except Exception:
+                md5 = None
+            if md5:
+                cand = md5[:8]
+                if cand in results:
+                    key, desc = cand, results[cand]
         if desc is None:
-            desc = results.get(f"noid_{id(elem)}")
-        if desc is None:
+            alt = f"noid_{id(elem)}"
+            if alt in results:
+                key, desc = alt, results[alt]
+        if desc is None or not key:
             return None
-        p = ""
-        if paths and short_id in paths:
-            p = paths[short_id]
-        return (short_id, desc, p)
+        p = (paths or {}).get(key, "")
+        return (key, desc, p)
 
     def _fill_official_text(self, text: str, mtype: str, desc: str, p: str) -> str:
         """把 message_str 里的官方空占位替换为带描述的官方格式（只替换第一处）。
