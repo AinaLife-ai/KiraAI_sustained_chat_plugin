@@ -326,6 +326,18 @@ class ParallelMediaRecognizer:
                 # 直接覆盖会让它 stage2/stage3 拿不到图片（图片标识符永远空）
                 existing = getattr(event.message, self._media_attr, None) or {}
                 setattr(event.message, self._media_attr, {**existing, **media})
+                # 同时登记到「本会话本回合暂存索引」：stage3 兜底据此在 LLM 请求前
+                # 抢救未被回填的媒体。必须在本阶段就登记（不能只在 stage2 登记）——
+                # stage2 所在批次可能被第三方插件 stop 掉而根本不执行，那样 stage3
+                # 将无从得知有哪些待识别媒体，官方空占位 [Image , file_path: p] /
+                # [Sticker ] 就会原样送到 LLM（= 看不见图）。
+                if _sid:
+                    bucket = self._round_media.setdefault(_sid, {})
+                    bucket.update(media)
+                    # 有界清理（与 stage2 同范式）：最多保留 128 个 sid 的索引
+                    if len(self._round_media) > 128:
+                        for old_sid in list(self._round_media)[: len(self._round_media) - 64]:
+                            self._round_media.pop(old_sid, None)
         except Exception:
             logger.exception("stage1 error")
 
@@ -764,12 +776,40 @@ class ParallelMediaRecognizer:
         if not self.enabled:
             return
         try:
-            need: dict[str, str] = {}  # sid -> 标识符类型
+            need: dict[str, str] = {}  # sid -> 标识符/占位形态
             for p in getattr(req, "user_prompt", []) or []:
                 text = getattr(p, "content", "") or ""
                 for m in _ALL_RE.finditer(text):
                     if not m.group(2).strip():
                         need[m.group(1)] = m.group(0)
+            # —— 官方空占位兜底 ——
+            # 本模块把「待识别」表达为 caption=""（框架渲染成 [Image , file_path: p] /
+            # [Sticker ]）。若 stage2 因异常或第三方插件 stop 批次而未回填，上面的标识符
+            # 匹配抓不到这类占位 → LLM 会收到毫无描述的空占位（表现为"看不见图"）。
+            # 这里按本会话暂存索引反查「caption 仍为空」的媒体，只要请求文本里确实带着
+            # 对应空占位，就一并纳入抢救（有原媒体 → 现场识别；已识别过 → (未识别)）。
+            official: dict[str, tuple] = {}   # media_id -> (elem, mtype)
+            _texts = [getattr(pp, "content", "") or "" for pp in (getattr(req, "user_prompt", []) or [])]
+            for mid, info in (self._round_media.get(event.sid) or {}).items():
+                if mid in need or not isinstance(info, dict):
+                    continue
+                elem = info.get("elem")
+                mtype = info.get("type")
+                if elem is None or mtype not in ("Image", "Sticker"):
+                    continue                    # Record 走标识符路径，不在此列
+                try:
+                    if (getattr(elem, "caption", None) or "").strip():
+                        continue                # 已回填，无需抢救
+                except Exception:
+                    continue
+                if mtype == "Image":
+                    _p = await self._media_path(elem)
+                    anchor = f"[Image , file_path: {_p}]" if _p else "[Image ]"
+                else:
+                    anchor = "[Sticker ]"
+                if any(anchor in t for t in _texts):
+                    official[mid] = (elem, mtype)
+                    need[mid] = anchor
             if not need:
                 return
             results: dict[str, str] = {}
@@ -809,6 +849,16 @@ class ParallelMediaRecognizer:
             for p in getattr(req, "user_prompt", []) or []:
                 text = getattr(p, "content", "") or ""
                 new_text = self._fill_text(text, results, paths)
+                # 官方空占位替换（stage3 抢救路径专用）
+                for mid, (elem, mtype) in official.items():
+                    _desc = results.get(mid)
+                    if _desc is None:
+                        continue
+                    new_text = self._fill_official_text(new_text, mtype, _desc, paths.get(mid, ""))
+                    try:
+                        elem.caption = _desc        # 同步写回元素，避免二次渲染仍是空占位
+                    except Exception:
+                        pass
                 if new_text != text:
                     p.content = new_text
         except Exception:

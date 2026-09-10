@@ -386,6 +386,9 @@ class BatchMergeScheduler:
             adapter=last.adapter,
             session=last.session,
             messages=msgs,
+            # 必须继承原批次的 model_group（框架：自定义模型组，未设则回退默认 LLM）。
+            # 不继承会让「会话级模型组」的批次被合并后静默改用默认模型。
+            model_group=list(getattr(last, "model_group", None) or []),
             extra={"merged_from": [b.batch.event_id for b in batches],
                    "_qm_self": True},  # 自发布标记：on_batch_message 识别后无条件放行
         )
