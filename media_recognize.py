@@ -73,13 +73,6 @@ class ParallelMediaRecognizer:
         # 图片识别完全由本模块接管（本模块能力已覆盖 PIR：并行 VLM + 缓存 + 限流 + 转发拍平 + 语音）。
         # 运行时实时检测（与 _pir_active 同理），PIR 热插拔/手动开启后自动再次关闭。
         self.pir_auto_disable = bool(sec.get("pir_auto_disable", True))
-        # 批次已进 LLM 时，是否补识别「此前被判定不识别」的媒体：
-        #   off     = 不补（旧行为：LLM 可能收到空占位，看不见图）
-        #   mention = 只补「因仅唤醒识别而跳过」的（默认）——这批既然真的要送进 LLM，
-        #             它就是"本次要让模型看的消息"，补识别不是浪费；不补则模型只看到
-        #             空占位。主动搭话/存在感触发的非唤醒批次，正是这种情况。
-        #   all     = 再补「概率未中」的；「超出每消息上限」（cap，防图片轰炸）始终尊重。
-        self.rescue_skipped_on_llm = str(sec.get("rescue_skipped_on_llm", "mention")).lower()
         self.quality_enabled = sec.get("quality_enabled", False)
         self.quality_value = int(sec.get("quality_value", 85))
 
@@ -834,17 +827,19 @@ class ParallelMediaRecognizer:
                         _cap = getattr(_elem, "caption", None)
                         if _cap is not None and str(_cap).strip():
                             continue            # 已有描述
-                        # PIR 的跳过标记：一律尊重
+                        # PIR 的跳过标记：一律尊重（那是并行识图插件的分工，不是省钱）
                         if getattr(_elem, "_pir_skip", False):
                             continue
-                        # 我方「明确不识别」标记：按原因区分处理
-                        if getattr(_elem, "_media_skip", False):
-                            _reason = getattr(_elem, "_media_skip_reason", "") or ""
-                            _mode = self.rescue_skipped_on_llm
-                            _ok = (_reason == "mention" and _mode in ("mention", "all")) or \
-                                  (_reason == "probability" and _mode == "all")
-                            if not _ok:
-                                continue
+                        # 「超出每消息媒体上限」的截断：尊重（防图片轰炸，是显式上限）
+                        if getattr(_elem, "_media_skip_reason", "") == "cap":
+                            continue
+                        # 其余「跳过」（非唤醒 / 概率未中）在这里不生效。
+                        #   跳过的唯一目的是「不给不会进 LLM 的围观消息白付 VLM」；
+                        #   而此处是 on_llm_request —— 这批**已经确定要进 LLM**。
+                        #   官方语义就是「进批次的媒体就识别」（框架 render：
+                        #   `if ele.caption is None: desc_img(...)`，内置聊天插件从不碰 media）。
+                        #   若在这里仍留空占位，等于：照付了那几行占位的 input token，
+                        #   却让模型瞎着眼回复 —— 纯亏，没有任何省钱意义。
                         mtype = "Sticker" if isinstance(_elem, Sticker) else "Image"
                         anchor = _anchor_of(_elem, mtype, await self._media_path(_elem))
                         if not any(anchor in t for t in _texts):
@@ -873,7 +868,7 @@ class ParallelMediaRecognizer:
                 _why: dict[str, int] = {}
                 for _mid in need:
                     _el = (_rm.get(_mid) or {}).get("elem")
-                    _r = (getattr(_el, "_media_skip_reason", "") or "未认领") if _el is not None else "未认领"
+                    _r = (getattr(_el, "_media_skip_reason", "") or "stage2未回填") if _el is not None else "stage2未回填"
                     _why[_r] = _why.get(_r, 0) + 1
                 _detail = ", ".join(f"{k}×{v}" for k, v in _why.items())
                 logger.info(f"空占位兜底 <{event.sid}>：抢救 {len(need)} 个媒体"
