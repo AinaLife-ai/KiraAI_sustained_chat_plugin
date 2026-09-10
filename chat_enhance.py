@@ -50,6 +50,68 @@ def _safe_float(v, default: float) -> float:
     except (TypeError, ValueError):
         return default
 
+_NUM_SEP_RE = re.compile(r"[,，;；、\s]+")
+
+
+def _flatten_values(values) -> list:
+    """把「分值」列表拍平成纯数字（字符串）列表。
+
+    WebUI 的分值字段是**标签输入**（TagInput：输入一个按回车加一个标签），正常用法
+    是一个标签一个数字；但用户也可能在一个标签里写成 "10,5" / "10 5" / "10、5"。
+    这里按常见分隔符拆开，避免 `float("10,5")` 失败后静默回退成默认值造成困惑。
+    仅对**分值**做此处理——关键词不拆（词本身可能含空格，如 "iPhone 15"）。
+    """
+    out = []
+    for v in (values or []):
+        if isinstance(v, (int, float)):
+            out.append(v)
+            continue
+        for part in _NUM_SEP_RE.split(str(v).strip()):
+            if part:
+                out.append(part)
+    return out
+
+
+def _pair_keywords(words, values, default_value: float = 5.0) -> list:
+    """把「关键词列表」与「分值列表」配对成 [(word, value), ...]。
+
+    配对规则（用户约定）：
+      · values 为空            → 全部使用 default_value；
+      · values 少于 words      → 最后一个分值**沿用**给后面的词
+                                 （如 words=[A,B,C] + values=[10,5] → A=10, B=5, C=5）；
+      · values 多于 words      → **多余的分值忽略**（如 words=[A] + values=[10,5] → 只取 A=10）；
+      · values 只有一个数      → 该数作用于全部词。
+    关键词统一小写做子串匹配（与宿主 _check_stop_keywords / waking_words 口径一致）。
+    """
+    ws = [str(w).strip().lower() for w in (words or []) if str(w).strip()]
+    vs = [_safe_float(v, default_value) for v in _flatten_values(values)]
+    out = []
+    for i, w in enumerate(ws):
+        v = (vs[i] if i < len(vs) else vs[-1]) if vs else default_value
+        out.append((w, v))
+    return out
+
+
+def _is_self_message(event) -> bool:
+    """判定事件是否为 bot 自己的发言（群聊/私聊一致）。
+
+    适配器会把 bot 自己发出的消息也作为普通消息事件送达（例如 NapCat 的
+    reportSelfMessage），其特征是 message.self_id == sender.user_id。
+    宿主 handle_msg 已整条 discard 这类消息；此处再判一次作为兜底，
+    确保「评分加减关键词」永远不会被 bot 自己的发言计分。
+    """
+    try:
+        msg = getattr(event, "message", None)
+        self_id = getattr(msg, "self_id", None)
+        sender = getattr(msg, "sender", None)
+        uid = getattr(sender, "user_id", None) if sender is not None else None
+        if self_id in (None, "") or uid in (None, ""):
+            return False
+        return str(self_id) == str(uid)
+    except Exception:
+        return False
+
+
 # ---------------------------------------------------------------------------
 # 存在感节流
 # ---------------------------------------------------------------------------
@@ -77,6 +139,14 @@ class PresenceThrottle:
         self.score_increment = max(0.0, _safe_float(cfg.get("score_increment"), 1.0))
         self.score_penalty = max(0.0, _safe_float(cfg.get("score_penalty"), 5.0))
         self.score_cap = max(1.0, _safe_float(cfg.get("score_cap"), 100.0))
+        # 评分加减关键词（用户自定义）：命中加分词 / 减分词时直接作用于累计分
+        # 分值配对规则见 _pair_keywords（values 不足沿用最后一个、多余忽略）
+        self._kw_boost = _pair_keywords(
+            cfg.get("score_boost_words"), cfg.get("score_boost_values"), 5.0
+        )
+        self._kw_penalty = _pair_keywords(
+            cfg.get("score_penalty_words"), cfg.get("score_penalty_values"), 5.0
+        )
         # sid -> deque[(ts, is_bot)]，容量 512
         self._timeline: dict[str, deque] = defaultdict(lambda: deque(maxlen=512))
         # sid -> 平均静默间隔（秒），用于闲时相对判定
@@ -105,6 +175,33 @@ class PresenceThrottle:
 
     def note_bot_reply(self, sid: str, ts: float) -> None:
         self.note_incoming(sid, ts, is_bot=True)
+
+    def apply_keyword_score(self, sid: str, text: str):
+        """按配置的加减分关键词对文本计分，直接作用于该会话的累计分。
+
+        规则：
+          · 大小写不敏感的子串匹配（文本统一 lower 后匹配小写关键词）；
+          · 同一个词在一条消息里出现多次**只计一次**；
+          · 加分词命中 + 对应分值，减分词命中 − 对应分值，同一条消息可同时命中两类；
+          · 结果受 score_cap 上限与 0 下限约束（与 note_incoming 同一口径）。
+        返回 (delta, hits)；hits 为 [(词, 实际增减分), ...]，未配置/未命中返回 (0.0, [])。
+        """
+        if not text or (not self._kw_boost and not self._kw_penalty):
+            return 0.0, []
+        low = text.lower()
+        delta = 0.0
+        hits = []
+        for w, v in self._kw_boost:
+            if w in low:
+                delta += v
+                hits.append((w, v))
+        for w, v in self._kw_penalty:
+            if w in low:
+                delta -= v
+                hits.append((w, -v))
+        if delta:
+            self._scores[sid] = max(0.0, min(self.score_cap, self._scores[sid] + delta))
+        return delta, hits
 
     # ---- 统计 ----
 
@@ -712,6 +809,12 @@ class ChatEnhanceEngine:
             "idle_bonus_score": _safe_float(cfg.get("dm_idle_bonus_score"), 15),
             "idle_bonus_ratio": _safe_float(cfg.get("dm_idle_bonus_ratio"), 1.5),
         }
+        # 评分加减关键词：群聊/私聊**共用同一份**配置（用户约定），
+        # 故显式注入 dm 子配置，否则私聊 PresenceThrottle 读不到。
+        for _k in ("score_boost_words", "score_boost_values",
+                   "score_penalty_words", "score_penalty_values"):
+            if _k in cfg:
+                _dm_cfg[_k] = cfg[_k]
         self.dm_presence = PresenceThrottle(_dm_cfg) if self.dm_presence_enabled else self.presence
         self.mentioned_dm_score_gate_deny = bool(cfg.get("mentioned_dm_score_gate_deny", False))
         self.mentioned_dm_score_gate_boost = bool(cfg.get("mentioned_dm_score_gate_boost", False))
@@ -843,6 +946,26 @@ class ChatEnhanceEngine:
         now = time.time()
         is_dm = not getattr(event, "is_group_message", lambda: True)()
         self._get_presence(is_dm).note_incoming(sid, now, is_bot=False)
+
+        # 评分加减关键词（用户自定义）：命中加分词/减分词时直接补正累计分。
+        # 仅统计**用户**消息——bot 自己的发言不计分（宿主 handle_msg 已整条丢弃
+        # 自己的消息，此处 _is_self_message 再兜底一次）。文本口径与既有
+        # sustain_stop_keywords / waking_words 一致：仅消息自身的顶层 Text。
+        if not _is_self_message(event):
+            try:
+                _text = "".join(
+                    e.text for e in (event.message.chain or []) if _Text is not None and isinstance(e, _Text)
+                )
+            except Exception:
+                _text = ""
+            if _text:
+                _delta, _hits = self._get_presence(is_dm).apply_keyword_score(sid, _text)
+                if _delta and logger.DEBUG:
+                    _detail = " ".join(f"{w}{'+' if d > 0 else ''}{d:g}" for w, d in _hits)
+                    logger.debug(
+                        f"[Enhance] 关键词计分 {sid}: {_delta:+g}（{_detail}）"
+                        f" → 累计 {self._get_presence(is_dm).score(sid, now):g}"
+                    )
 
         # 骚扰检测（戳/at/关键词/引用）
         kind = self._detect_kind(event)

@@ -353,8 +353,12 @@ class BatchMergeScheduler:
 
     def _has_media(self, pb: PendingBatch) -> bool:
         for m in pb.batch.messages:
-            # 本插件 stage1 暂存（_pir_media）与并行识图插件（PIR）暂存（_pir_images）
-            # 都要检查：stage1 已把媒体替换为 Text 占位符，只看 chain 元素会漏判
+            # 三重判定，任一命中即视为含媒体：
+            #   1) _pir_media   —— 本插件 stage1 的暂存索引（图片/表情）
+            #   2) _pir_images  —— 并行识图插件（PIR）的暂存索引
+            #   3) chain 元素   —— 保底：图片/表情**仍留在 chain 中**（stage1 只设 caption，
+            #                      不替换元素）；而语音 Record 在 stage1 会被替换成 Text
+            #                      标识符，此时靠 (1) 命中。
             if getattr(m, "_pir_media", None):
                 return True
             if getattr(m, "_pir_images", None):
