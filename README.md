@@ -1,14 +1,14 @@
 # KiraAI_sustained_chat_plugin/可持续聊天 v2.5.14
 
-v2.5.14 关键修复：媒体识别回填被后续插件覆盖
-- **根因**：本插件的媒体兜底（stage3）注册在 `Priority.HIGH`（最先执行），而 **KSM 会话合并(-50)** / **CC 上下文压缩(-51)** 等插件会在 `on_llm_request` 里**重建 `req.messages`** —— 我们在它们之前回填，结果被整体覆盖，请求里仍是空占位 `[Image , file_path: p]` / `[Sticker ]`（表现为"看不见图"）。
-- **修复**：媒体 stage3 优先级改为 **-60（最后一个执行）**，确保回填落在最终请求文本上；同时保留写回 `elem.caption`，任何后续重渲染也带着描述。
-
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI_sustained_chat_plugin)
 
 # — 让 AI 真“主动”起来
 
 > 这不是一个普通的聊天优化插件，而是一套完整的“社交主动性引擎”。
+
+v2.5.14 关键修复：媒体识别回填被后续插件覆盖
+- **根因**：本插件的媒体兜底（stage3）注册在 `Priority.HIGH`（最先执行），而 **KSM 会话合并(-50)** / **CC 上下文压缩(-51)** 等插件会在 `on_llm_request` 里**重建 `req.messages`** —— 我们在它们之前回填，结果被整体覆盖，请求里仍是空占位 `[Image , file_path: p]` / `[Sticker ]`（表现为"看不见图"）。
+- **修复**：媒体 stage3 优先级改为 **-60（最后一个执行）**，确保回填落在最终请求文本上；同时保留写回 `elem.caption`，任何后续重渲染也带着描述。
 
 v2.5.13 修复空占位「看不见图」+ 真·媒体预处理（预取）：
 - **官方怎么做的**：框架 render 里 `if ele.caption is None: desc_img(...)` —— 只要媒体要渲染进 LLM 请求就识别（内置聊天插件从不碰 media）。「跳过识别」是本插件独有的省钱机制。
