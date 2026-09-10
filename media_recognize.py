@@ -81,6 +81,7 @@ class ParallelMediaRecognizer:
         #   _pf_tasks[media_id] = Task（去重 + 放行时收尾等待）
         self._results_pool: dict[str, dict] = {}
         self._pf_tasks: dict[str, "asyncio.Task"] = {}
+        self._pf_infos: dict[str, dict] = {}
         self.quality_enabled = sec.get("quality_enabled", False)
         self.quality_value = int(sec.get("quality_value", 85))
 
@@ -633,6 +634,11 @@ class ParallelMediaRecognizer:
             task = self._pf_tasks.pop(mid, None)
             if task is not None and not task.done():
                 task.cancel()
+                # 取消 ≠ 已识别：必须把 _done 复位，否则该媒体之后进了别的批次时
+                # stage2 会认为"已处理"而跳过 → 退回空占位（这才是真正的漏图）
+                info = self._pf_infos.pop(mid, None)
+                if isinstance(info, dict):
+                    info["_done"] = False
                 n += 1
         return n
 
@@ -699,6 +705,10 @@ class ParallelMediaRecognizer:
             if len(self._results_pool) > 128:
                 for old in list(self._results_pool)[: len(self._results_pool) - 64]:
                     self._results_pool.pop(old, None)
+            # 单会话结果池同样有界（防长时间运行无界增长）
+            if len(pool) > 512:
+                for old in list(pool)[: len(pool) - 256]:
+                    pool.pop(old, None)
             batch_img_sem = asyncio.Semaphore(max(1, self.max_parallel_images))
             batch_aud_sem = asyncio.Semaphore(max(1, self.max_parallel_audios))
             for media_id, info in media.items():
@@ -711,6 +721,7 @@ class ParallelMediaRecognizer:
                     coro = self._transcribe_one(sid, media_id, info, pool, batch_sem=batch_aud_sem)
                 task = asyncio.ensure_future(coro)
                 self._pf_tasks[media_id] = task
+                self._pf_infos[media_id] = info
                 task.add_done_callback(
                     lambda t, mid=media_id, inf=info, pl=pool: self._prefetch_done(mid, inf, pl)
                 )
@@ -720,6 +731,9 @@ class ParallelMediaRecognizer:
     def _prefetch_done(self, media_id: str, info: dict, pool: dict) -> None:
         """预取收尾：写回 elem.caption（渲染即为带描述格式），并清任务表。"""
         self._pf_tasks.pop(media_id, None)
+        self._pf_infos.pop(media_id, None)
+        # _done 保持 True：语义是「已处理过（成功/失败都不重试）」，防重复 VLM。
+        # 结果已在结果池里，stage2 会以池打底取到它。（取消路径才复位 _done）
         try:
             desc = pool.get(media_id)
             elem = info.get("elem")
