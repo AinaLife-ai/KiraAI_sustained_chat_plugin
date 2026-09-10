@@ -1798,7 +1798,10 @@ class DebouncePlugin(BasePlugin):
     async def on_media_rec_batch(self, event: KiraMessageBatchEvent, *_):
         await self.media_recognizer.on_im_batch_message(event)
 
-    @on.llm_request(priority=Priority.HIGH)
+    # ⚠ 必须**最后**执行（低于 KSM 会话合并 -50 / CC 上下文压缩 -51）：
+    # 那些插件会在 on_llm_request 里重建 req.messages/user_prompt，若我们先回填
+    # 就会被它们整体覆盖 → 请求里仍是空占位（[Image , file_path: p] / [Sticker ]）。
+    @on.llm_request(priority=-60)
     async def on_media_rec_llm(self, event: KiraMessageBatchEvent, req: LLMRequest, *_):
         await self.media_recognizer.on_llm_request(event, req)
 
