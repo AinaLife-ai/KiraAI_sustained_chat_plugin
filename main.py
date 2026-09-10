@@ -1126,15 +1126,19 @@ class DebouncePlugin(BasePlugin):
     # ========== 消息处理钩子 ==========
     @on.im_message(priority=Priority.HIGH)
     async def handle_msg(self, event: KiraMessageEvent, *_):
-        # --- 修复：过滤机器人自己的私聊消息 ---
-        if not event.is_group_message():
-            # 正确获取 self_id
-            self_id = str(event.message.self_id) if hasattr(event.message, 'self_id') and event.message.self_id is not None else None
-            sender_id = str(event.message.sender.user_id) if event.message.sender else None
-            if self_id and sender_id and self_id == sender_id:
-                logger.debug(f"[Debounce] 忽略机器人自己的私聊消息: {event.message.message_id}")
-                event.discard()
-                return
+        # --- 过滤机器人自己的消息（群聊/私聊一致）---
+        # 适配器会把 bot 自己发出的消息也作为普通消息事件送达（取决于实现/配置，例如
+        # NapCat 的 reportSelfMessage），其 message.self_id 与 sender.user_id 相同。
+        # 若不过滤：消息会被 note_incoming(is_bot=False) 记成「用户消息」——存在感占比、
+        # 累计评分、额外信号（user_msgs/session_msgs）、骚扰检测全部被自身发言污染，
+        # 且与 on.message_sent 的 note_bot_reply(is_bot=True) 重复计数。
+        # bot 自身发言的正确统计口径是「发送事件」(on.message_sent)，故此处整条丢弃。
+        self_id = str(event.message.self_id) if hasattr(event.message, 'self_id') and event.message.self_id is not None else None
+        sender_id = str(event.message.sender.user_id) if event.message.sender else None
+        if self_id and sender_id and self_id == sender_id:
+            logger.debug(f"[Debounce] 忽略机器人自己的消息: {event.message.message_id}")
+            event.discard()
+            return
 
         # === 空通知事件过滤：QQ 戳一戳别人等系统通知（message_id=None、零内容元素）。
         #     完全不进评分/前文/判定/顺延/骚扰统计（群聊/私聊一致）；poke bot 事件框架会构造 [Poke ...] 文本
