@@ -1,4 +1,12 @@
-# KiraAI_sustained_chat_plugin/可持续聊天 v2.5.13 修复空占位「看不见图」+ 真·媒体预处理（预取）：
+# KiraAI_sustained_chat_plugin/可持续聊天 v2.5.13
+
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI_sustained_chat_plugin)
+
+# — 让 AI 真“主动”起来
+
+> 这不是一个普通的聊天优化插件，而是一套完整的“社交主动性引擎”。
+
+v2.5.13 修复空占位「看不见图」+ 真·媒体预处理（预取）：
 - **官方怎么做的**：框架 render 里 `if ele.caption is None: desc_img(...)` —— 只要媒体要渲染进 LLM 请求就识别（内置聊天插件从不碰 media）。「跳过识别」是本插件独有的省钱机制。
 - **真·预处理（本次新增）**：消息**确定进入批次**（`event.buffer()`）时立刻在后台预取它的媒体 —— 而这段时间正是「上一个批次的 LLM 还在跑 / 本批次在队列里排队」的空窗。放行时 stage2 直接从结果池命中，**本批次关键路径零识别开销**（实测放行后 VLM=0）。被 `discard()` 的消息走不到 buffer ⇒ 不预取、不浪费。私聊同样生效。
 - **尊重「仅唤醒识别」**：非唤醒消息的媒体（`_media_skip_reason=mention`）、概率未中、超出每消息上限的，**既不预取也不兜底**——空占位是这些开关的既定代价，不是 bug。
