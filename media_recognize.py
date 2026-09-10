@@ -79,6 +79,8 @@ class ParallelMediaRecognizer:
         # 本批次的关键路径上零识别开销。
         #   _results_pool[sid][media_id] = desc（与 stage2 的 results 同格式，可直接打底）
         #   _pf_tasks[media_id] = Task（去重 + 放行时收尾等待）
+        # 预取总开关：由 queue_merge 的「媒体预处理合并限制」控制（关掉 = 彻底不做预处理）
+        self.prefetch_enabled = True
         self._results_pool: dict[str, dict] = {}
         self._pf_tasks: dict[str, "asyncio.Task"] = {}
         self._pf_infos: dict[str, dict] = {}
@@ -675,7 +677,7 @@ class ParallelMediaRecognizer:
         「上一个批次的 LLM 还在跑 / 本批次在队列里排队」的空窗 —— 正好用掉。
         被 discard 的消息走不到这里 → 不会浪费 VLM。
         """
-        if not self.enabled:
+        if not self.enabled or not self.prefetch_enabled:
             return
         msgs = [m for m in (messages or []) if m is not None]
         if not msgs:
