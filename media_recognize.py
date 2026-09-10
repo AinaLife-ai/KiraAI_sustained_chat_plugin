@@ -73,6 +73,13 @@ class ParallelMediaRecognizer:
         # 图片识别完全由本模块接管（本模块能力已覆盖 PIR：并行 VLM + 缓存 + 限流 + 转发拍平 + 语音）。
         # 运行时实时检测（与 _pir_active 同理），PIR 热插拔/手动开启后自动再次关闭。
         self.pir_auto_disable = bool(sec.get("pir_auto_disable", True))
+        # 批次已进 LLM 时，是否补识别「此前被判定不识别」的媒体：
+        #   off     = 不补（旧行为：LLM 可能收到空占位，看不见图）
+        #   mention = 只补「因仅唤醒识别而跳过」的（默认）——这批既然真的要送进 LLM，
+        #             它就是"本次要让模型看的消息"，补识别不是浪费；不补则模型只看到
+        #             空占位。主动搭话/存在感触发的非唤醒批次，正是这种情况。
+        #   all     = 再补「概率未中」的；「超出每消息上限」（cap，防图片轰炸）始终尊重。
+        self.rescue_skipped_on_llm = str(sec.get("rescue_skipped_on_llm", "mention")).lower()
         self.quality_enabled = sec.get("quality_enabled", False)
         self.quality_value = int(sec.get("quality_value", 85))
 
@@ -827,10 +834,17 @@ class ParallelMediaRecognizer:
                         _cap = getattr(_elem, "caption", None)
                         if _cap is not None and str(_cap).strip():
                             continue            # 已有描述
-                        # 尊重「明确不识别」标记（非唤醒跳过 / 超限截断 / PIR 跳过）：
-                        # 这些媒体本就该保持空占位以省 token，绝不能在这里被重新识别。
-                        if getattr(_elem, "_media_skip", False) or getattr(_elem, "_pir_skip", False):
+                        # PIR 的跳过标记：一律尊重
+                        if getattr(_elem, "_pir_skip", False):
                             continue
+                        # 我方「明确不识别」标记：按原因区分处理
+                        if getattr(_elem, "_media_skip", False):
+                            _reason = getattr(_elem, "_media_skip_reason", "") or ""
+                            _mode = self.rescue_skipped_on_llm
+                            _ok = (_reason == "mention" and _mode in ("mention", "all")) or \
+                                  (_reason == "probability" and _mode == "all")
+                            if not _ok:
+                                continue
                         mtype = "Sticker" if isinstance(_elem, Sticker) else "Image"
                         anchor = _anchor_of(_elem, mtype, await self._media_path(_elem))
                         if not any(anchor in t for t in _texts):
@@ -854,6 +868,18 @@ class ParallelMediaRecognizer:
                         need[mid] = anchor
             if not need:
                 return
+            try:
+                _rm = self._round_media.setdefault(event.sid, {})
+                _why: dict[str, int] = {}
+                for _mid in need:
+                    _el = (_rm.get(_mid) or {}).get("elem")
+                    _r = (getattr(_el, "_media_skip_reason", "") or "未认领") if _el is not None else "未认领"
+                    _why[_r] = _why.get(_r, 0) + 1
+                _detail = ", ".join(f"{k}×{v}" for k, v in _why.items())
+                logger.info(f"空占位兜底 <{event.sid}>：抢救 {len(need)} 个媒体"
+                            f"（{_detail}）——这批已进 LLM，不留空占位")
+            except Exception:
+                pass
             results: dict[str, str] = {}
             # 批次级限流同样作用于 stage3 兜底识别（一个 LLM 请求内的残留标识符 = 一个批次）
             batch_img_sem = asyncio.Semaphore(max(1, self.max_parallel_images))
@@ -865,7 +891,9 @@ class ParallelMediaRecognizer:
                 info = round_media.get(media_id)
                 if info and not info.get("_done"):
                     # 有原媒体且未识别过 → 现场识别
-                    if info["type"] == "Image":
+                    # 注意：Sticker 与 Image 一样走 VLM 描述（与 stage2 的
+                    # `type in ("Image","Sticker")` 判定保持一致），只有 Record 走 STT。
+                    if info["type"] in ("Image", "Sticker"):
                         # 原生多模态模式：图片不识别，直接标 (未识别) 占位
                         if self._native_mode(event.sid):
                             results[media_id] = "(未识别)"
