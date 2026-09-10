@@ -789,12 +789,19 @@ class ParallelMediaRecognizer:
             # 这里按本会话暂存索引反查「caption 仍为空」的媒体，只要请求文本里确实带着
             # 对应空占位，就一并纳入抢救（有原媒体 → 现场识别；已识别过 → (未识别)）。
             official: dict[str, tuple] = {}   # media_id -> (elem, mtype)
+            round_media = self._round_media.setdefault(event.sid, {})
             _texts = [getattr(pp, "content", "") or "" for pp in (getattr(req, "user_prompt", []) or [])]
-            for mid, info in (self._round_media.get(event.sid) or {}).items():
+
+            def _anchor_of(elem, mtype, path):
+                if mtype == "Image":
+                    return f"[Image , file_path: {path}]" if path else "[Image ]"
+                return "[Sticker ]"
+
+            # ① 本会话暂存索引（我方 stage1 认领过的媒体）
+            for mid, info in list(round_media.items()):
                 if mid in need or not isinstance(info, dict):
                     continue
-                elem = info.get("elem")
-                mtype = info.get("type")
+                elem, mtype = info.get("elem"), info.get("type")
                 if elem is None or mtype not in ("Image", "Sticker"):
                     continue                    # Record 走标识符路径，不在此列
                 try:
@@ -802,14 +809,49 @@ class ParallelMediaRecognizer:
                         continue                # 已回填，无需抢救
                 except Exception:
                     continue
-                if mtype == "Image":
-                    _p = await self._media_path(elem)
-                    anchor = f"[Image , file_path: {_p}]" if _p else "[Image ]"
-                else:
-                    anchor = "[Sticker ]"
+                anchor = _anchor_of(elem, mtype, await self._media_path(elem))
                 if any(anchor in t for t in _texts):
                     official[mid] = (elem, mtype)
                     need[mid] = anchor
+
+            # ② 直接扫描本批次消息链：捕获「我方完全没认领（caption is None / ""）
+            #    但请求里仍是空占位」的媒体——例如消息在 ON_IM_MESSAGE 阶段被其它插件
+            #    stop 掉，我方 stage1 从未执行；或批次被第三方拦截后消息才进入请求。
+            #    这是最后一道保险：凡是请求里出现空占位、而我们又确实拿到了原元素，
+            #    就在这里补齐描述，绝不让空占位进 LLM。
+            if not self._pir_active() and not self._native_mode(event.sid):
+                for _m in (getattr(event, "messages", None) or []):
+                    for _elem in self._iter_media_elems(getattr(_m, "chain", None)):
+                        if not isinstance(_elem, (Image, Sticker)):
+                            continue
+                        _cap = getattr(_elem, "caption", None)
+                        if _cap is not None and str(_cap).strip():
+                            continue            # 已有描述
+                        # 尊重「明确不识别」标记（非唤醒跳过 / 超限截断 / PIR 跳过）：
+                        # 这些媒体本就该保持空占位以省 token，绝不能在这里被重新识别。
+                        if getattr(_elem, "_media_skip", False) or getattr(_elem, "_pir_skip", False):
+                            continue
+                        mtype = "Sticker" if isinstance(_elem, Sticker) else "Image"
+                        anchor = _anchor_of(_elem, mtype, await self._media_path(_elem))
+                        if not any(anchor in t for t in _texts):
+                            continue
+                        _md5 = None
+                        try:
+                            _md5 = await _elem.hash_image()
+                        except Exception:
+                            _md5 = None
+                        mid = _md5[:8] if _md5 else f"noid_{id(_elem)}"
+                        if mid in need:
+                            continue
+                        round_media.setdefault(mid, {
+                            "md5": _md5, "elem": _elem, "type": mtype, "_done": False,
+                        })
+                        try:
+                            _elem._pir_short_id = mid
+                        except Exception:
+                            pass
+                        official[mid] = (_elem, mtype)
+                        need[mid] = anchor
             if not need:
                 return
             results: dict[str, str] = {}
