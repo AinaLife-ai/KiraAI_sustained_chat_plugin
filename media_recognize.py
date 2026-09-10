@@ -73,6 +73,14 @@ class ParallelMediaRecognizer:
         # 图片识别完全由本模块接管（本模块能力已覆盖 PIR：并行 VLM + 缓存 + 限流 + 转发拍平 + 语音）。
         # 运行时实时检测（与 _pir_active 同理），PIR 热插拔/手动开启后自动再次关闭。
         self.pir_auto_disable = bool(sec.get("pir_auto_disable", True))
+        # ── 预取池（真·预处理）────────────────────────────────────────────
+        # 场景：消息已确定进入批次，而上一个批次的 LLM 还在跑 / 本批次还在队列里排队。
+        # 这段空窗不该浪费 —— 立刻在后台把 VLM/STT 跑掉；放行时 stage2 直接命中结果，
+        # 本批次的关键路径上零识别开销。
+        #   _results_pool[sid][media_id] = desc（与 stage2 的 results 同格式，可直接打底）
+        #   _pf_tasks[media_id] = Task（去重 + 放行时收尾等待）
+        self._results_pool: dict[str, dict] = {}
+        self._pf_tasks: dict[str, "asyncio.Task"] = {}
         self.quality_enabled = sec.get("quality_enabled", False)
         self.quality_value = int(sec.get("quality_value", 85))
 
@@ -505,6 +513,12 @@ class ParallelMediaRecognizer:
                 for old_sid in list(self._round_media)[: len(self._round_media) - 64]:
                     self._round_media.pop(old_sid, None)
 
+            # 本批次里正在预取的媒体：先等它收尾（正常此时早已完成，等待开销≈0）。
+            # 这一步保证「预取还没跑完也不会漏」—— 绝不退回空占位。
+            _pf_wait = [self._pf_tasks[mid] for _, md in tasks for mid in md if mid in self._pf_tasks]
+            if _pf_wait:
+                await asyncio.gather(*_pf_wait, return_exceptions=True)
+
             # 只识别未处理（_done=False）的媒体：缓存命中（stage1 已填描述）或
             # 已识别过（成功/失败）的跳过——队列合并重发同一批消息时不会重复 VLM/STT
             pending_tasks = [
@@ -524,7 +538,8 @@ class ParallelMediaRecognizer:
             # 批次级信号量：每批次临时创建，限制本批次内同时识别的数量（突发保护）
             batch_img_sem = asyncio.Semaphore(max(1, self.max_parallel_images))
             batch_aud_sem = asyncio.Semaphore(max(1, self.max_parallel_audios))
-            results: dict[str, str] = {}
+            # 预取池打底：排队 / 上一批次期间已完成的预取结果直接命中 → 关键路径零开销
+            results: dict[str, str] = dict(self._results_pool.get(sess_sid) or {})
             coros = []
             for _, media in pending_tasks:
                 for short_id, info in media.items():
@@ -605,6 +620,124 @@ class ParallelMediaRecognizer:
                     for sub in (getattr(ele, "chains", None) or []):
                         yield from _walk(sub)
         yield from _walk(chain)
+
+    # ============ 预取（真·预处理）：排队 / 上一批次还在跑时先识别 ============
+
+    def schedule_prefetch(self, sid: str, messages) -> None:
+        """非阻塞入口：把这些消息里的媒体丢给后台识别。
+
+        调用时机 = 「消息已确定进入批次」（handle_msg 里 event.buffer() 之后）：
+        此时它一定会被送进 LLM，识别不会白做；而这段时间多半正是
+        「上一个批次的 LLM 还在跑 / 本批次在队列里排队」的空窗 —— 正好用掉。
+        被 discard 的消息走不到这里 → 不会浪费 VLM。
+        """
+        if not self.enabled:
+            return
+        msgs = [m for m in (messages or []) if m is not None]
+        if not msgs:
+            return
+        try:
+            asyncio.create_task(self._prefetch_worker(sid, msgs))
+        except Exception as e:
+            logger.debug(f"prefetch schedule failed: {type(e).__name__}: {e}")
+
+    async def _prefetch_worker(self, sid: str, messages) -> None:
+        """收集待识别媒体 → 起后台识别任务（与 stage2 共用缓存 / 限流 / 结果池）。"""
+        try:
+            if self._pir_active() or self._native_mode(sid):
+                return
+            media: dict = {}
+            visited: set = set()
+            for m in messages:
+                # ① stage1 已登记的待识别媒体（含已被替换掉的 Record 语音）
+                for k, v in (getattr(m, "_pir_media", None) or {}).items():
+                    if isinstance(v, dict) and not v.get("_done") and k not in media:
+                        media[k] = v
+                # ② 链上「此前被判定不识别」的媒体（非唤醒 / 概率未中）：
+                #    既然已确定进批次，就该识别 —— 这正是「进批次就识别」
+                await self._collect_skipped_media(
+                    getattr(m, "chain", None), media, visited, sid
+                )
+            if not media:
+                return
+            pool = self._results_pool.setdefault(sid, {})
+            # 防无界增长：最多保留 128 个会话的结果池
+            if len(self._results_pool) > 128:
+                for old in list(self._results_pool)[: len(self._results_pool) - 64]:
+                    self._results_pool.pop(old, None)
+            batch_img_sem = asyncio.Semaphore(max(1, self.max_parallel_images))
+            batch_aud_sem = asyncio.Semaphore(max(1, self.max_parallel_audios))
+            for media_id, info in media.items():
+                if info.get("_done") or media_id in pool or media_id in self._pf_tasks:
+                    continue
+                info["_done"] = True
+                if info["type"] in ("Image", "Sticker"):
+                    coro = self._describe_one(sid, media_id, info, pool, batch_sem=batch_img_sem)
+                else:
+                    coro = self._transcribe_one(sid, media_id, info, pool, batch_sem=batch_aud_sem)
+                task = asyncio.ensure_future(coro)
+                self._pf_tasks[media_id] = task
+                task.add_done_callback(
+                    lambda t, mid=media_id, inf=info, pl=pool: self._prefetch_done(mid, inf, pl)
+                )
+        except Exception as e:
+            logger.debug(f"prefetch worker failed: {type(e).__name__}: {e}")
+
+    def _prefetch_done(self, media_id: str, info: dict, pool: dict) -> None:
+        """预取收尾：写回 elem.caption（渲染即为带描述格式），并清任务表。"""
+        self._pf_tasks.pop(media_id, None)
+        try:
+            desc = pool.get(media_id)
+            elem = info.get("elem")
+            if desc and elem is not None and not (getattr(elem, "caption", None) or "").strip():
+                elem.caption = desc      # 既阻止框架自动 VLM，又让渲染直接带描述
+        except Exception:
+            pass
+
+    async def _collect_skipped_media(self, chain, media: dict, visited: set, sid: str) -> None:
+        """收集链上此前被标记「跳过」的媒体（非唤醒 / 概率未中），用于预取。
+
+        尊重：「每消息媒体上限」(_media_skip_reason == "cap") 与 PIR 的 _pir_skip。
+        键与 stage1/stage2 保持一致（优先复用钉在元素上的 _pir_short_id）。
+        """
+        if chain is None:
+            return
+        cid = id(chain)
+        if cid in visited:
+            return
+        visited.add(cid)
+        for elem in chain:
+            if isinstance(elem, (Image, Sticker)):
+                if getattr(elem, "_pir_skip", False):
+                    continue
+                if (getattr(elem, "caption", None) or "").strip():
+                    continue                                   # 已有描述
+                if (getattr(elem, "_media_skip_reason", "") or "") == "cap":
+                    continue                                   # 显式上限：保持空占位
+                key = getattr(elem, "_pir_short_id", None)
+                if key and key in media:
+                    continue
+                try:
+                    md5 = await elem.hash_image()
+                except Exception:
+                    md5 = None
+                if not key:
+                    key = md5[:8] if md5 else f"noid_{id(elem)}"
+                    try:
+                        elem._pir_short_id = key                # 钉住键：stage2/stage3 共用
+                    except Exception:
+                        pass
+                media.setdefault(key, {
+                    "md5": md5,
+                    "elem": elem,
+                    "type": "Sticker" if isinstance(elem, Sticker) else "Image",
+                    "_done": False,
+                })
+            elif isinstance(elem, Reply):
+                await self._collect_skipped_media(getattr(elem, "chain", None), media, visited, sid)
+            elif isinstance(elem, Forward):
+                for sub in (getattr(elem, "chains", None) or []):
+                    await self._collect_skipped_media(sub, media, visited, sid)
 
     async def _describe_one(self, sess_sid: str, media_id: str, info: dict, results: dict,
                             batch_sem: Optional[asyncio.Semaphore] = None):
