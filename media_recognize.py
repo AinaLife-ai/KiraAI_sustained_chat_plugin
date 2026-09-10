@@ -73,6 +73,17 @@ class ParallelMediaRecognizer:
         # 图片识别完全由本模块接管（本模块能力已覆盖 PIR：并行 VLM + 缓存 + 限流 + 转发拍平 + 语音）。
         # 运行时实时检测（与 _pir_active 同理），PIR 热插拔/手动开启后自动再次关闭。
         self.pir_auto_disable = bool(sec.get("pir_auto_disable", True))
+        # ── 预取池（真·预处理）────────────────────────────────────────────
+        # 场景：消息已确定进入批次，而上一个批次的 LLM 还在跑 / 本批次还在队列里排队。
+        # 这段空窗不该浪费 —— 立刻在后台把 VLM/STT 跑掉；放行时 stage2 直接命中结果，
+        # 本批次的关键路径上零识别开销。
+        #   _results_pool[sid][media_id] = desc（与 stage2 的 results 同格式，可直接打底）
+        #   _pf_tasks[media_id] = Task（去重 + 放行时收尾等待）
+        # 预取总开关：由 queue_merge 的「媒体预处理合并限制」控制（关掉 = 彻底不做预处理）
+        self.prefetch_enabled = True
+        self._results_pool: dict[str, dict] = {}
+        self._pf_tasks: dict[str, "asyncio.Task"] = {}
+        self._pf_infos: dict[str, dict] = {}
         self.quality_enabled = sec.get("quality_enabled", False)
         self.quality_value = int(sec.get("quality_value", 85))
 
@@ -505,10 +516,16 @@ class ParallelMediaRecognizer:
                 for old_sid in list(self._round_media)[: len(self._round_media) - 64]:
                     self._round_media.pop(old_sid, None)
 
-            # 只识别未处理（_done=False）的媒体：缓存命中（stage1 已填描述）或
-            # 已识别过（成功/失败）的跳过——队列合并重发同一批消息时不会重复 VLM/STT
+            # 本批次里正在预取的媒体：先等它收尾（正常此时早已完成，等待开销≈0）。
+            # 这一步保证「预取还没跑完也不会漏」—— 绝不退回空占位。
+            _pf_wait = [self._pf_tasks[mid] for _, md in tasks for mid in md if mid in self._pf_tasks]
+            if _pf_wait:
+                await asyncio.gather(*_pf_wait, return_exceptions=True)
+
+            # 判据 = 结果池里有没有它（不看 _done）：已有描述则跳过（重发同一批不重复 VLM/STT）；
+            # 没有描述（含"尝试过但失败/结果被淘汰"）则重新识别 → 保证不会退回空占位
             pending_tasks = [
-                (message, {k: v for k, v in media.items() if not v.get("_done")})
+                (message, {k: v for k, v in media.items() if not self._has_desc(sess_sid, k)})
                 for message, media in tasks
             ]
             pending_tasks = [(m, md) for m, md in pending_tasks if md]
@@ -524,7 +541,8 @@ class ParallelMediaRecognizer:
             # 批次级信号量：每批次临时创建，限制本批次内同时识别的数量（突发保护）
             batch_img_sem = asyncio.Semaphore(max(1, self.max_parallel_images))
             batch_aud_sem = asyncio.Semaphore(max(1, self.max_parallel_audios))
-            results: dict[str, str] = {}
+            # 预取池打底：排队 / 上一批次期间已完成的预取结果直接命中 → 关键路径零开销
+            results: dict[str, str] = dict(self._results_pool.get(sess_sid) or {})
             coros = []
             for _, media in pending_tasks:
                 for short_id, info in media.items():
@@ -605,6 +623,135 @@ class ParallelMediaRecognizer:
                     for sub in (getattr(ele, "chains", None) or []):
                         yield from _walk(sub)
         yield from _walk(chain)
+
+    # ============ 预取（真·预处理）：排队 / 上一批次还在跑时先识别 ============
+
+    def _has_desc(self, sid: str, media_id: str) -> bool:
+        """该媒体**是否已有描述结果**（唯一判据 = 结果池里有它）。
+
+        刻意不看 _done：_done 只代表"尝试过"。识别失败或结果被淘汰时，
+        不该让这张图永远拿不到描述（那就会退回空占位）—— 池里没有就再试一次。
+        """
+        return media_id in (self._results_pool.get(sid) or {})
+
+    def cancel_prefetch(self, media_ids) -> int:
+        """取消这些媒体的**在飞**预取（批次被丢弃时调用：这批不进 LLM 了，别再烧 VLM）。
+
+        已完成的识别结果**保留**在结果池 —— 按 md5 命中，之后同图再出现时免费复用。
+        """
+        n = 0
+        for mid in list(media_ids or ()):
+            task = self._pf_tasks.pop(mid, None)
+            if task is not None and not task.done():
+                task.cancel()
+                # 取消 ≠ 已识别：必须把 _done 复位，否则该媒体之后进了别的批次时
+                # stage2 会认为"已处理"而跳过 → 退回空占位（这才是真正的漏图）
+                info = self._pf_infos.pop(mid, None)
+                if isinstance(info, dict):
+                    info["_done"] = False
+                n += 1
+        return n
+
+    @staticmethod
+    def collect_prefetch_ids(messages) -> set:
+        """取出一批消息里「预取用到的 media_id」（丢批次时用它取消）。"""
+        ids = set()
+        for m in (messages or []):
+            for k in (getattr(m, "_pir_media", None) or {}):
+                ids.add(k)
+            stack = [getattr(m, "chain", None)]
+            seen = set()
+            while stack:
+                ch = stack.pop()
+                if ch is None or id(ch) in seen:
+                    continue
+                seen.add(id(ch))
+                for ele in ch:
+                    sid_ = getattr(ele, "_pir_short_id", None)
+                    if sid_:
+                        ids.add(sid_)
+                    sub = getattr(ele, "chain", None)
+                    if sub is not None:
+                        stack.append(sub)
+                    for fwd in (getattr(ele, "chains", None) or []):
+                        stack.append(fwd)
+        return ids
+
+    def schedule_prefetch(self, sid: str, messages) -> None:
+        """非阻塞入口：把这些消息里的媒体丢给后台识别。
+
+        调用时机 = 「消息已确定进入批次」（handle_msg 里 event.buffer() 之后）：
+        此时它一定会被送进 LLM，识别不会白做；而这段时间多半正是
+        「上一个批次的 LLM 还在跑 / 本批次在队列里排队」的空窗 —— 正好用掉。
+        被 discard 的消息走不到这里 → 不会浪费 VLM。
+        """
+        if not self.enabled or not self.prefetch_enabled:
+            return
+        msgs = [m for m in (messages or []) if m is not None]
+        if not msgs:
+            return
+        try:
+            asyncio.create_task(self._prefetch_worker(sid, msgs))
+        except Exception as e:
+            logger.debug(f"prefetch schedule failed: {type(e).__name__}: {e}")
+
+    async def _prefetch_worker(self, sid: str, messages) -> None:
+        """收集待识别媒体 → 起后台识别任务（与 stage2 共用缓存 / 限流 / 结果池）。"""
+        try:
+            if self._pir_active() or self._native_mode(sid):
+                return
+            media: dict = {}
+            for m in messages:
+                # 只取 stage1 已登记的「待识别」媒体（含已被替换掉的 Record 语音）。
+                # 被显式判定不识别的媒体（仅唤醒识别的非唤醒媒体 / 概率未中 / 超上限）
+                # 不在这里 —— 那是配置要求的省 VLM，预取它等于绕过用户的开关。
+                for k, v in (getattr(m, "_pir_media", None) or {}).items():
+                    if isinstance(v, dict) and not v.get("_done") and k not in media:
+                        media[k] = v
+            if not media:
+                return
+            pool = self._results_pool.setdefault(sid, {})
+            # 防无界增长：最多保留 128 个会话的结果池
+            if len(self._results_pool) > 128:
+                for old in list(self._results_pool)[: len(self._results_pool) - 64]:
+                    self._results_pool.pop(old, None)
+            # 单会话结果池同样有界（防长时间运行无界增长）
+            if len(pool) > 512:
+                for old in list(pool)[: len(pool) - 256]:
+                    pool.pop(old, None)
+            batch_img_sem = asyncio.Semaphore(max(1, self.max_parallel_images))
+            batch_aud_sem = asyncio.Semaphore(max(1, self.max_parallel_audios))
+            for media_id, info in media.items():
+                if self._has_desc(sid, media_id) or media_id in self._pf_tasks:
+                    continue          # 已有描述 → 不重复；正在飞 → 去重（失败后允许再试）
+                info["_done"] = True
+                if info["type"] in ("Image", "Sticker"):
+                    coro = self._describe_one(sid, media_id, info, pool, batch_sem=batch_img_sem)
+                else:
+                    coro = self._transcribe_one(sid, media_id, info, pool, batch_sem=batch_aud_sem)
+                task = asyncio.ensure_future(coro)
+                self._pf_tasks[media_id] = task
+                self._pf_infos[media_id] = info
+                task.add_done_callback(
+                    lambda t, mid=media_id, inf=info, pl=pool: self._prefetch_done(mid, inf, pl)
+                )
+        except Exception as e:
+            logger.debug(f"prefetch worker failed: {type(e).__name__}: {e}")
+
+    def _prefetch_done(self, media_id: str, info: dict, pool: dict) -> None:
+        """预取收尾：写回 elem.caption（渲染即为带描述格式），并清任务表。"""
+        self._pf_tasks.pop(media_id, None)
+        self._pf_infos.pop(media_id, None)
+        # _done 仅用于"同批次内防并发重复建 coro"；是否算"已处理"一律以结果池为准
+        # （见 _has_desc）：失败/被淘汰的媒体会在后续阶段自动再试一次，不会留下空占位。
+        # 取消路径复位 _done，保证语义一致。
+        try:
+            desc = pool.get(media_id)
+            elem = info.get("elem")
+            if desc and elem is not None and not (getattr(elem, "caption", None) or "").strip():
+                elem.caption = desc      # 既阻止框架自动 VLM，又让渲染直接带描述
+        except Exception:
+            pass
 
     async def _describe_one(self, sess_sid: str, media_id: str, info: dict, results: dict,
                             batch_sem: Optional[asyncio.Semaphore] = None):
@@ -792,25 +939,38 @@ class ParallelMediaRecognizer:
             round_media = self._round_media.setdefault(event.sid, {})
             _texts = [getattr(pp, "content", "") or "" for pp in (getattr(req, "user_prompt", []) or [])]
 
-            def _anchor_of(elem, mtype, path):
+            def _anchor_of(elem, mtype, path, mid=None):
+                # 锚点必须跟随元素**当前**的 caption：渲染用的是 `[Image {caption}, file_path: p]`，
+                # caption 为空 → `[Image , file_path: p]`；失败占位 → `[Image (未识别), file_path: p]`。
+                # 否则「失败后重试」会因为锚点对不上而永远救不回来。
+                _cap = str(getattr(elem, "caption", None) or "")
                 if mtype == "Image":
-                    return f"[Image , file_path: {path}]" if path else "[Image ]"
-                return "[Sticker ]"
+                    return f"[Image {_cap}, file_path: {path}]" if path else f"[Image {_cap}]"
+                if mtype == "Record":
+                    # 语音走标识符路径（stage1 已把 Record 换成 Text [Record #id: ]）
+                    return f"[Record #{mid}: ]" if mid else None
+                return f"[Sticker {_cap}]"
 
             # ① 本会话暂存索引（我方 stage1 认领过的媒体）
             for mid, info in list(round_media.items()):
                 if mid in need or not isinstance(info, dict):
                     continue
                 elem, mtype = info.get("elem"), info.get("type")
-                if elem is None or mtype not in ("Image", "Sticker"):
-                    continue                    # Record 走标识符路径，不在此列
-                try:
-                    if (getattr(elem, "caption", None) or "").strip():
-                        continue                # 已回填，无需抢救
-                except Exception:
+                if elem is None or mtype not in ("Image", "Sticker", "Record"):
                     continue
-                anchor = _anchor_of(elem, mtype, await self._media_path(elem))
-                if any(anchor in t for t in _texts):
+                if mtype == "Record":
+                    # 语音元素已被换成 Text 标识符，用「标识符是否仍为空」判空
+                    if not any(f"[Record #{mid}: ]" in t for t in _texts):
+                        continue
+                else:
+                    try:
+                        _cap = (getattr(elem, "caption", None) or "").strip()
+                        if _cap and _cap != "(未识别)":
+                            continue            # 已有真描述才跳过；(未识别) 允许再试一次
+                    except Exception:
+                        continue
+                anchor = _anchor_of(elem, mtype, await self._media_path(elem), mid)
+                if anchor and any(anchor in t for t in _texts):
                     official[mid] = (elem, mtype)
                     need[mid] = anchor
 
@@ -824,12 +984,20 @@ class ParallelMediaRecognizer:
                     for _elem in self._iter_media_elems(getattr(_m, "chain", None)):
                         if not isinstance(_elem, (Image, Sticker)):
                             continue
-                        _cap = getattr(_elem, "caption", None)
-                        if _cap is not None and str(_cap).strip():
-                            continue            # 已有描述
-                        # 尊重「明确不识别」标记（非唤醒跳过 / 超限截断 / PIR 跳过）：
-                        # 这些媒体本就该保持空占位以省 token，绝不能在这里被重新识别。
-                        if getattr(_elem, "_media_skip", False) or getattr(_elem, "_pir_skip", False):
+                        _cap = str(getattr(_elem, "caption", None) or "").strip()
+                        if _cap and _cap != "(未识别)":
+                            continue            # 已有真描述才跳过；(未识别) 允许再试一次
+                        # PIR 的跳过标记：一律尊重（并行识图插件的分工）
+                        if getattr(_elem, "_pir_skip", False):
+                            continue
+                        # 我方**显式**「不识别」标记，一律尊重：
+                        #   mention     = 仅唤醒识别开启时的非唤醒媒体（用户要省这笔 VLM）
+                        #   probability = 概率未中（用户掷骰子要省）
+                        #   cap         = 超出每消息媒体上限（防图片轰炸）
+                        # 这些保持空占位是**配置的既定代价**，不是 bug，绝不能在这里偷偷补。
+                        # 这里只救「本该识别却没补上」的：没有跳过标记、caption 仍为空
+                        # （stage2 没跑 / md5 键变化 / 批次被第三方插件截断等）。
+                        if getattr(_elem, "_media_skip", False):
                             continue
                         mtype = "Sticker" if isinstance(_elem, Sticker) else "Image"
                         anchor = _anchor_of(_elem, mtype, await self._media_path(_elem))
@@ -854,6 +1022,18 @@ class ParallelMediaRecognizer:
                         need[mid] = anchor
             if not need:
                 return
+            try:
+                _rm = self._round_media.setdefault(event.sid, {})
+                _why: dict[str, int] = {}
+                for _mid in need:
+                    _el = (_rm.get(_mid) or {}).get("elem")
+                    _r = (getattr(_el, "_media_skip_reason", "") or "stage2未回填") if _el is not None else "stage2未回填"
+                    _why[_r] = _why.get(_r, 0) + 1
+                _detail = ", ".join(f"{k}×{v}" for k, v in _why.items())
+                logger.info(f"空占位兜底 <{event.sid}>：抢救 {len(need)} 个媒体"
+                            f"（{_detail}）——这批已进 LLM，不留空占位")
+            except Exception:
+                pass
             results: dict[str, str] = {}
             # 批次级限流同样作用于 stage3 兜底识别（一个 LLM 请求内的残留标识符 = 一个批次）
             batch_img_sem = asyncio.Semaphore(max(1, self.max_parallel_images))
@@ -863,9 +1043,11 @@ class ParallelMediaRecognizer:
             round_media = self._round_media.get(event.sid, {})
             for media_id in need:
                 info = round_media.get(media_id)
-                if info and not info.get("_done"):
+                if info and not self._has_desc(event.sid, media_id):
                     # 有原媒体且未识别过 → 现场识别
-                    if info["type"] == "Image":
+                    # 注意：Sticker 与 Image 一样走 VLM 描述（与 stage2 的
+                    # `type in ("Image","Sticker")` 判定保持一致），只有 Record 走 STT。
+                    if info["type"] in ("Image", "Sticker"):
                         # 原生多模态模式：图片不识别，直接标 (未识别) 占位
                         if self._native_mode(event.sid):
                             results[media_id] = "(未识别)"
@@ -896,7 +1078,8 @@ class ParallelMediaRecognizer:
                     _desc = results.get(mid)
                     if _desc is None:
                         continue
-                    new_text = self._fill_official_text(new_text, mtype, _desc, paths.get(mid, ""))
+                    new_text = self._fill_official_text(new_text, mtype, _desc, paths.get(mid, ""),
+                                                        old_anchor=need.get(mid))
                     try:
                         elem.caption = _desc        # 同步写回元素，避免二次渲染仍是空占位
                     except Exception:
@@ -960,7 +1143,8 @@ class ParallelMediaRecognizer:
         p = (paths or {}).get(key, "")
         return (key, desc, p)
 
-    def _fill_official_text(self, text: str, mtype: str, desc: str, p: str) -> str:
+    def _fill_official_text(self, text: str, mtype: str, desc: str, p: str,
+                            old_anchor: Optional[str] = None) -> str:
         """把 message_str 里的官方空占位替换为带描述的官方格式（只替换第一处）。
 
         空占位形态（caption="" 时框架渲染）：
@@ -968,6 +1152,16 @@ class ParallelMediaRecognizer:
           Sticker→ "[Sticker ]"
         识别后形态："[Image {desc}, file_path: {p}]" / "[Sticker {desc}, file_path: {p}]"
         """
+        if old_anchor:
+            # stage3 抢救：按文本里**实际存在**的锚点精确替换
+            # （caption 可能已是 "(未识别)" → 形态为 "[Image (未识别), file_path: p]"）
+            if mtype == "Image":
+                filled = f"[Image {desc}, file_path: {p}]" if p else f"[Image {desc}]"
+            elif mtype == "Sticker":
+                filled = f"[Sticker {desc}, file_path: {p}]" if p else f"[Sticker {desc}]"
+            else:
+                filled = None
+            return text.replace(old_anchor, filled, 1) if filled else text
         if mtype == "Image":
             filled = f"[Image {desc}, file_path: {p}]" if p else f"[Image {desc}]"
             if p:

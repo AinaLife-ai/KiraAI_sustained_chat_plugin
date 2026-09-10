@@ -1,10 +1,19 @@
-# KiraAI_sustained_chat_plugin/可持续聊天 v2.5.12
+# KiraAI_sustained_chat_plugin/可持续聊天 v2.5.13
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI_sustained_chat_plugin)
 
 # — 让 AI 真“主动”起来
 
 > 这不是一个普通的聊天优化插件，而是一套完整的“社交主动性引擎”。
+
+v2.5.13 修复空占位「看不见图」+ 真·媒体预处理（预取）：
+- **官方怎么做的**：框架 render 里 `if ele.caption is None: desc_img(...)` —— 只要媒体要渲染进 LLM 请求就识别（内置聊天插件从不碰 media）。「跳过识别」是本插件独有的省钱机制。
+- **真·预处理（本次新增）**：消息**确定进入批次**（`event.buffer()`）时立刻在后台预取它的媒体 —— 而这段时间正是「上一个批次的 LLM 还在跑 / 本批次在队列里排队」的空窗。放行时 stage2 直接从结果池命中，**本批次关键路径零识别开销**（实测放行后 VLM=0）。被 `discard()` 的消息走不到 buffer ⇒ 不预取、不浪费。私聊同样生效。
+- **尊重「仅唤醒识别」**：非唤醒消息的媒体（`_media_skip_reason=mention`）、概率未中、超出每消息上限的，**既不预取也不兜底**——空占位是这些开关的既定代价，不是 bug。
+- **兜底只救「本该识别却没补上」的**：`on_llm_request` 时仍无描述、且**没有跳过标记**的媒体（stage2 没跑 / md5 键变化 / 批次被第三方插件截断）→ 现场补识别并回填 prompt 与 `caption`。
+- **引用链**：唤醒消息里 `Reply.chain` 上的媒体按唤醒处理 → 会识别（「引用那条带图消息 + 叫我」能看图）。
+- **顺带修复**：兜底把 `Sticker` 误判为音频走了 STT 分支（应与 stage2 的 `type in ("Image","Sticker")` 一致走 VLM）。
+- **不需要任何新配置。**
 
 v2.5.12 追加修复（媒体空占位兜底 + 合并批次模型组）：
 - **新增「官方空占位」兜底抢救**：此前只能在 LLM 请求前抢救 `[Image #id: ]` 形式的标识符，而图片/表情包实际渲染成官方空占位 `[Image , file_path: p]` / `[Sticker ]`——一旦 stage2 因异常或第三方插件（如批次级拦截插件）**stop 掉批次**而未回填，这类空占位会被原样送进 LLM（表现为"看不见图"），且**没有任何兜底**。现在 stage1 就把待识别索引登记到会话回合表，stage3 在 LLM 请求前反查「caption 仍为空」的媒体并现场补齐。

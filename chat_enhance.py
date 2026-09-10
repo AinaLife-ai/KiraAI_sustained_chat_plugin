@@ -134,7 +134,7 @@ class PresenceThrottle:
         # 闲时相对判定倍数：静默时长 > 该会话历史平均 × 倍数 才算闲时（默认 1.5）
         self.idle_bonus_ratio = max(0.0, _safe_float(cfg.get("idle_bonus_ratio"), 1.5))
         self.force_suppress = bool(cfg.get("force_suppress", False))
-        self.score_gate_enabled = bool(cfg.get("score_gate_enabled", False))
+        self.score_gate_enabled = bool(cfg.get("score_gate_enabled", True))
         # 累计加分（评分补正用）：用户消息 +1，bot 回复 -5，攒到阈值补触发一次后清零
         self.score_increment = max(0.0, _safe_float(cfg.get("score_increment"), 1.0))
         self.score_penalty = max(0.0, _safe_float(cfg.get("score_penalty"), 5.0))
@@ -826,6 +826,8 @@ class ChatEnhanceEngine:
         self.harass = HarassDetector(cfg, plugin)
         self.dormant = DormantState(cfg)
         self.merger = NoticeMerger(plugin, merge_seconds)
+        # 评分门总开关（引擎侧读取；此前只在 PresenceThrottle 里赋值，引擎读它会 AttributeError）
+        self.score_gate_enabled = bool(cfg.get("score_gate_enabled", True))
         self.score_threshold = _safe_float(cfg.get("score_threshold"), 60.0)
         # 评分补正：门槛过滤 + 补偿触发 独立控制（三个通路各自独立）
         self.score_gate_deny = bool(cfg.get("score_gate_deny", False))
@@ -1140,6 +1142,9 @@ class ChatEnhanceEngine:
         boost 概率未命中 + 评分够 → 强制触发（必补），触发后清零
         deny+boost 同时开启 → 两者都生效（分不够拦、分够了补）
         """
+        if not self.score_gate_enabled:
+            # 评分门总开关：关闭后评分系统完全不介入（忽略所有 门槛过滤/补偿触发 设置）
+            return prob_hit
         deny, boost = self._score_gate_flags(scope)
         if not deny and not boost:
             return prob_hit

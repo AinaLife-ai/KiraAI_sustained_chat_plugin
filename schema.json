@@ -630,7 +630,7 @@
         "name": "媒体预处理合并限制",
         "type": "switch",
         "default": true,
-        "hint": "开启时：含图片/语音的批次合并数量受下方上限约束，避免 VLM/STT 预处理过长；关闭时：不限制"
+        "hint": "开启时：含图片/语音的批次合并数量受下方上限约束，避免 VLM/STT 预处理过长；关闭时：不限制。**同时是「媒体预取」总开关**：关闭后排队等待期间不再提前识别媒体（放行时才识别）。"
       },
       "media_preprocess_max_batches": {
         "name": "媒体预处理最大合并批次数",
@@ -781,6 +781,12 @@
         "name": "强制通路超额抑制",
         "default": false,
         "hint": "开启后 bot 发言占比过高时，被唤醒也降级为评分门槛（分值到了才回）"
+      },
+      "score_gate_enabled": {
+        "name": "评分门总开关",
+        "type": "switch",
+        "default": true,
+        "hint": "评分系统（门槛过滤 + 补偿触发）的总开关。关闭后完全忽略下面所有门槛/补偿设置，评分不介入触发判定；开启时按各通路各自的 deny/boost 设置生效。默认开启。"
       },
       "score_threshold": {
         "type": "float",

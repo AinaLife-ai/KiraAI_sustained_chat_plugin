@@ -237,6 +237,10 @@ class DebouncePlugin(BasePlugin):
         self.merge_scheduler = BatchMergeScheduler(ctx, cfg, bot_cfg)
         # 并行媒体识别（ParallelMediaRecognizer）
         self.media_recognizer = ParallelMediaRecognizer(ctx, cfg, bot_cfg)
+        # 供「丢弃积压批次时取消在飞预取」使用（被丢弃的那批不会进 LLM，别白烧 VLM）
+        self.merge_scheduler.media_recognizer = self.media_recognizer
+        # 预取受「媒体预处理合并限制」开关控制（关掉它 = 不预取）
+        self.media_recognizer.prefetch_enabled = self.merge_scheduler.media_preprocess_enabled
         # ========== 聊天增强引擎（存在感节流/骚扰感知化/休眠状态机/通知合并） ==========
         # 引擎内 PresenceThrottle/DormantState 读扁平键，HarassDetector 读 section_* 键，
         # 因此配置需同时保留 section 结构 + 拍平 presence/dormant 键
@@ -1398,6 +1402,9 @@ class DebouncePlugin(BasePlugin):
                         buffer.pop(count=buffer.get_length()-self.max_unmentioned_messages+1)
                 # 批次已开始：不裁剪（批次内消息只进不出，直到满即推/顺延到点）
                 event.buffer()
+                # 消息已确定进入批次 → 立刻后台预取媒体（含此前被判定"不识别"的）：
+                # 上一个批次的 LLM 正在跑 / 本批次在队列排队，这段时间正好用来识别
+                self.media_recognizer.schedule_prefetch(sid, [event.message])
                 if _batch_on:
                     # 批次计数 +1，满即推检查
                     self.batch_count[sid] = self.batch_count.get(sid, 0) + 1
@@ -1440,6 +1447,8 @@ class DebouncePlugin(BasePlugin):
 
         # === 唤醒消息：启动/延续批次 ===
         event.buffer()
+        # 同上：唤醒消息一进批次就预取，等排队/上一批次跑完时识别早已就绪
+        self.media_recognizer.schedule_prefetch(sid, [event.message])
         if not self.batch_started.get(sid, False):
             # 首个唤醒消息：批次开始，计数从 1（含唤醒本身）
             self.batch_started[sid] = True
@@ -1917,10 +1926,12 @@ class DebouncePlugin(BasePlugin):
                 if self.image_recognition_only_on_mention:
                     # 非唤醒：不识别（省 VLM），元素保留 → 官方空占位 [Image , file_path: p] / [Sticker ]
                     elem._media_skip = True
+                    elem._media_skip_reason = "mention"
                     elem.caption = ""  # 阻止框架渲染时 caption is None → 自动 VLM
                 else:
                     if random.random() >= self.image_recognition_probability:
                         elem._media_skip = True
+                        elem._media_skip_reason = "probability"
                         elem.caption = ""  # 阻止框架渲染时自动 VLM
             elif isinstance(elem, Forward):
                 # only_on_mention=True：仅唤醒消息保留转发；False：全部保留
@@ -1976,4 +1987,5 @@ class DebouncePlugin(BasePlugin):
             return
         for idx in reversed(media_indices[max_count:]):
             chain.message_list[idx]._media_skip = True
+            chain.message_list[idx]._media_skip_reason = "cap"
             chain.message_list[idx].caption = ""  # 阻止框架渲染时自动 VLM
