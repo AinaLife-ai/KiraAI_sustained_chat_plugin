@@ -237,6 +237,8 @@ class DebouncePlugin(BasePlugin):
         self.merge_scheduler = BatchMergeScheduler(ctx, cfg, bot_cfg)
         # 并行媒体识别（ParallelMediaRecognizer）
         self.media_recognizer = ParallelMediaRecognizer(ctx, cfg, bot_cfg)
+        # 供「丢弃积压批次时取消在飞预取」使用（被丢弃的那批不会进 LLM，别白烧 VLM）
+        self.merge_scheduler.media_recognizer = self.media_recognizer
         # ========== 聊天增强引擎（存在感节流/骚扰感知化/休眠状态机/通知合并） ==========
         # 引擎内 PresenceThrottle/DormantState 读扁平键，HarassDetector 读 section_* 键，
         # 因此配置需同时保留 section 结构 + 拍平 presence/dormant 键

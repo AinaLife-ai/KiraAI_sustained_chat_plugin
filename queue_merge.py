@@ -277,7 +277,10 @@ class BatchMergeScheduler:
         判定：批次内所有 mentioned 消息的 message_id 都在 hit_ids 中 → 该批次的
         触发完全来自持续命中，丢弃；含真实唤醒消息（@/唤醒词/引用回复，mentioned
         但不在 hit_ids）或不含任何 mentioned 消息的批次一律保留不动。
-        被丢弃批次的消息仍保留在会话缓冲中，仅少一次回复，上下文不丢。
+
+        注意（2026-09 核对）：框架 flush 时已把消息从会话缓冲弹出，本方法只丢弃
+        待推送批次、**不会**把消息放回缓冲 ⇒ 这批消息既不会进 LLM、也不会进后续
+        上下文。因此必须同步取消它们的媒体预取（否则预取的 VLM 纯属白烧）。
         只动 pending，不触碰 _inflight / _final_marked，不影响推送决策状态机。
         返回丢弃批次数。
         """
@@ -295,6 +298,15 @@ class BatchMergeScheduler:
                 if mentioned and all(getattr(m, "message_id", None) in hit_ids for m in mentioned):
                     dropped += 1
                     self._log(sid, f"停窗丢弃持续命中积压批次 {pb.batch.event_id}（{len(msgs)} 条）")
+                    # 这批不会进 LLM 了 → 取消它的媒体预取，别再烧 VLM
+                    try:
+                        rec = getattr(self, "media_recognizer", None)
+                        if rec is not None:
+                            n = rec.cancel_prefetch(rec.collect_prefetch_ids(msgs))
+                            if n:
+                                self._log(sid, f"同步取消 {n} 个在飞媒体预取（该批已丢弃）")
+                    except Exception as e:
+                        self._log(sid, f"取消预取失败：{type(e).__name__}: {e}")
                 else:
                     kept.append(pb)
             if dropped:

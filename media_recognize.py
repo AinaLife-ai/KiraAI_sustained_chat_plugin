@@ -623,6 +623,44 @@ class ParallelMediaRecognizer:
 
     # ============ 预取（真·预处理）：排队 / 上一批次还在跑时先识别 ============
 
+    def cancel_prefetch(self, media_ids) -> int:
+        """取消这些媒体的**在飞**预取（批次被丢弃时调用：这批不进 LLM 了，别再烧 VLM）。
+
+        已完成的识别结果**保留**在结果池 —— 按 md5 命中，之后同图再出现时免费复用。
+        """
+        n = 0
+        for mid in list(media_ids or ()):
+            task = self._pf_tasks.pop(mid, None)
+            if task is not None and not task.done():
+                task.cancel()
+                n += 1
+        return n
+
+    @staticmethod
+    def collect_prefetch_ids(messages) -> set:
+        """取出一批消息里「预取用到的 media_id」（丢批次时用它取消）。"""
+        ids = set()
+        for m in (messages or []):
+            for k in (getattr(m, "_pir_media", None) or {}):
+                ids.add(k)
+            stack = [getattr(m, "chain", None)]
+            seen = set()
+            while stack:
+                ch = stack.pop()
+                if ch is None or id(ch) in seen:
+                    continue
+                seen.add(id(ch))
+                for ele in ch:
+                    sid_ = getattr(ele, "_pir_short_id", None)
+                    if sid_:
+                        ids.add(sid_)
+                    sub = getattr(ele, "chain", None)
+                    if sub is not None:
+                        stack.append(sub)
+                    for fwd in (getattr(ele, "chains", None) or []):
+                        stack.append(fwd)
+        return ids
+
     def schedule_prefetch(self, sid: str, messages) -> None:
         """非阻塞入口：把这些消息里的媒体丢给后台识别。
 
@@ -876,9 +914,12 @@ class ParallelMediaRecognizer:
             round_media = self._round_media.setdefault(event.sid, {})
             _texts = [getattr(pp, "content", "") or "" for pp in (getattr(req, "user_prompt", []) or [])]
 
-            def _anchor_of(elem, mtype, path):
+            def _anchor_of(elem, mtype, path, mid=None):
                 if mtype == "Image":
                     return f"[Image , file_path: {path}]" if path else "[Image ]"
+                if mtype == "Record":
+                    # 语音走标识符路径（stage1 已把 Record 换成 Text [Record #id: ]）
+                    return f"[Record #{mid}: ]" if mid else None
                 return "[Sticker ]"
 
             # ① 本会话暂存索引（我方 stage1 认领过的媒体）
@@ -886,15 +927,20 @@ class ParallelMediaRecognizer:
                 if mid in need or not isinstance(info, dict):
                     continue
                 elem, mtype = info.get("elem"), info.get("type")
-                if elem is None or mtype not in ("Image", "Sticker"):
-                    continue                    # Record 走标识符路径，不在此列
-                try:
-                    if (getattr(elem, "caption", None) or "").strip():
-                        continue                # 已回填，无需抢救
-                except Exception:
+                if elem is None or mtype not in ("Image", "Sticker", "Record"):
                     continue
-                anchor = _anchor_of(elem, mtype, await self._media_path(elem))
-                if any(anchor in t for t in _texts):
+                if mtype == "Record":
+                    # 语音元素已被换成 Text 标识符，用「标识符是否仍为空」判空
+                    if not any(f"[Record #{mid}: ]" in t for t in _texts):
+                        continue
+                else:
+                    try:
+                        if (getattr(elem, "caption", None) or "").strip():
+                            continue            # 已回填，无需抢救
+                    except Exception:
+                        continue
+                anchor = _anchor_of(elem, mtype, await self._media_path(elem), mid)
+                if anchor and any(anchor in t for t in _texts):
                     official[mid] = (elem, mtype)
                     need[mid] = anchor
 
