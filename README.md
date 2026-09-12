@@ -1,10 +1,17 @@
-# KiraAI_sustained_chat_plugin/可持续聊天 v2.5.14
+# KiraAI_sustained_chat_plugin/可持续聊天 v2.5.15
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI_sustained_chat_plugin)
 
 # — 让 AI 真“主动”起来
 
 > 这不是一个普通的聊天优化插件，而是一套完整的“社交主动性引擎”。
+
+v2.5.15 修复「被第三方插件重建的媒体副本」导致官方 VLM 付费调用：
+- **现象（线上日志）**：同一张原图在上下文里出现两份——`download_10.jpg` 有本插件的描述、`download_11.jpg` 却是空占位 `[Image , file_path: …]`；随后框架在 agent 内部又发起一次官方 VLM（**付费**）。
+- **根因**：会话合并 / 上下文压缩类插件在 `on_llm_request` 用历史重建请求时，会把被回复消息的媒体**重新下载成另一个临时文件**；此刻链上已无对应元素，空占位只以**文本**形式留在回复引用的 `content` 里 → 本插件的元素兜底拿不到元素、`need` 为空 → 直接返回 → 框架 render 看到 `caption is None` → 官方 VLM。
+- **修复**：新增**文本级兜底** `_fill_empty_official_by_path()`——按空占位里的 `file_path` 取**文件内容 md5** 查描述缓存（与框架 `hash_image()` 的 path 分支同口径），命中就地替换成描述；不同编码/尺寸的副本再用 **dHash 感知哈希（汉明距离 ≤2）** 兜底。
+- **只做缓存命中补齐，不发起任何新识别**：拿不到元素就拿不到"跳过标记"，贸然识别会破坏用户"省这笔 VLM"的配置意图。
+- **效果**：同图换文件名 / 重压缩副本 / 嵌套在回复 `content` 内三种形态全部补齐，**0 次新增 VLM**。
 
 v2.5.14 关键修复：媒体识别回填被后续插件覆盖
 - **根因**：本插件的媒体兜底（stage3）注册在 `Priority.HIGH`（最先执行），而 **KSM 会话合并(-50)** / **CC 上下文压缩(-51)** 等插件会在 `on_llm_request` 里**重建 `req.messages`** —— 我们在它们之前回填，结果被整体覆盖，请求里仍是空占位 `[Image , file_path: p]` / `[Sticker ]`（表现为"看不见图"）。
