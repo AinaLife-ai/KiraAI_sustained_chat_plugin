@@ -49,6 +49,18 @@ _IMAGE_RE = re.compile(r"\[Image #([^\]\s:]+): ([^\]]*)\]")
 _RECORD_RE = re.compile(r"\[Record #([^\]\s:]+): ([^\]]*)\]")
 _ALL_RE = re.compile(r"\[(?:Image|Record) #([^\]\s:]+): ([^\]]*)\]")
 
+# 官方「空占位」：caption 为空时框架渲染成 [Image , file_path: xxx] / [Image ] / [Sticker ]。
+# 已有描述的形式（[Image 描述, file_path: …] / [Sticker 描述]）不会命中本正则。
+# 用途见 _fill_empty_official_by_path()：第三方插件把被回复消息的媒体重新下载成
+# **另一个临时文件**后，链上已无对应元素，只剩这段文本 → 只能按文件内容找描述。
+_EMPTY_OFFICIAL_RE = re.compile(r"\[(Image|Sticker)\s*(?:,\s*file_path:\s*([^\]\n]+?)\s*)?\]")
+
+# 感知哈希索引（进程内、跨会话）：md5 不同但画面相同的副本（重新下载 / 重新压缩）也能命中。
+# 只存「我们自己描述过」的图，键是 64bit dHash、值是描述；有界，超限丢最旧一半。
+_PHASH_INDEX: dict[str, str] = {}
+_PHASH_INDEX_MAX = 512
+_PHASH_BITS = 64
+
 
 class ParallelMediaRecognizer:
     """并行媒体识别：作为 mixin 组件挂在聊天插件上，与 queue_merge 解耦。"""
@@ -775,6 +787,8 @@ class ParallelMediaRecognizer:
             if desc and self._is_valid_desc(desc):
                 if md5:
                     await self._cache_set(md5, desc)
+                # 记下 dHash：同图被第三方插件重新下载/重压缩成另一字节流时，仍能命中描述
+                await self._phash_remember(info.get("elem"), desc)
                 results[media_id] = desc
             else:
                 logger.warning(f"image VLM returned empty/invalid desc id={media_id} md5={md5[:8] if md5 else 'n/a'}")
@@ -1020,6 +1034,15 @@ class ParallelMediaRecognizer:
                             pass
                         official[mid] = (_elem, mtype)
                         need[mid] = anchor
+            # ③ 文本级兜底：官方空占位按 file_path 的**内容哈希**补齐（零 VLM）。
+            #    必须放在 `if not need: return` **之前**——今天的泄露正是这样溜走的：
+            #    第三方插件（会话合并/上下文压缩）重建请求后链上已无元素，只剩文本里的
+            #    空占位 + 框架已下载的临时文件（同图不同名）→ need 为空 → 直接 return
+            #    → 框架 agent 内部渲染该元素时 caption is None → 官方 VLM 付费调用。
+            try:
+                await self._fill_empty_official_by_path(req, event.sid)
+            except Exception as e:
+                logger.warning(f"空占位按文件内容补齐失败 <{event.sid}>: {type(e).__name__}: {e}")
             if not need:
                 return
             try:
@@ -1193,6 +1216,138 @@ class ParallelMediaRecognizer:
                     self._fill_chain(sub, results, paths)
 
     # ================= 缓存（复用 image_desc_cache 表） =================
+
+    # ================= 空占位「按文件内容」兜底 =================
+
+    @staticmethod
+    async def _read_media_bytes(path) -> Optional[bytes]:
+        """读媒体文件字节（兼容 Windows/Linux 两种分隔符写法）。"""
+        if not path:
+            return None
+        raw = str(path).strip()
+
+        def _read():
+            for cand in (raw, raw.replace("\\", "/"), raw.replace("/", "\\")):
+                try:
+                    with open(cand, "rb") as f:
+                        return f.read()
+                except Exception:
+                    continue
+            return None
+
+        try:
+            return await asyncio.to_thread(_read)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _phash_of_bytes(data: Optional[bytes]) -> Optional[str]:
+        """64bit dHash（9x8 灰度相邻差）——抗压缩/缩放，用于匹配「同图不同字节」的副本。"""
+        if not data:
+            return None
+        try:
+            from PIL import Image as _PILImage
+            im = _PILImage.open(BytesIO(data)).convert("L").resize((9, 8))
+            px = list(im.getdata())
+            bits = 0
+            for row in range(8):
+                base = row * 9
+                for col in range(8):
+                    bits = (bits << 1) | (1 if px[base + col] > px[base + col + 1] else 0)
+            if bits in (0, (1 << _PHASH_BITS) - 1):
+                return None          # 退化哈希（纯色/纯渐变）：不能作为「同图」的依据
+            return f"{bits:016x}"
+        except Exception:
+            return None
+
+    @staticmethod
+    def _phash_nearest(ph: Optional[str]) -> Optional[str]:
+        """在索引里找**近似**项：dHash 对重压缩/缩放通常只差 1~2 bit（实测 q40 差 1）。
+
+        精确匹配会漏掉几乎全部"同图不同编码"的副本；索引有界（≤512），线性扫描可忽略。
+        """
+        if not ph:
+            return None
+        try:
+            v = int(ph, 16)
+        except Exception:
+            return None
+        best, best_d = None, 99
+        for k, desc in _PHASH_INDEX.items():
+            try:
+                d = bin(v ^ int(k, 16)).count("1")
+            except Exception:
+                continue
+            if d < best_d:
+                best, best_d = desc, d
+                if d == 0:
+                    break
+        return best if best_d <= 2 else None
+
+    async def _phash_remember(self, elem, desc: str):
+        """记住「我们刚描述过」的图的 dHash（进程内、有界），供同图不同字节的副本命中。"""
+        if not desc:
+            return
+        try:
+            path = await self._media_path(elem) if elem is not None else None
+            data = await self._read_media_bytes(path) if path else None
+            ph = self._phash_of_bytes(data)
+            if not ph:
+                return
+            if len(_PHASH_INDEX) >= _PHASH_INDEX_MAX:
+                for k in list(_PHASH_INDEX)[: _PHASH_INDEX_MAX // 2]:
+                    _PHASH_INDEX.pop(k, None)
+            _PHASH_INDEX[ph] = desc
+        except Exception:
+            pass
+
+    async def _fill_empty_official_by_path(self, req, sid: str) -> int:
+        """把请求文本里的**官方空占位**按 file_path 的内容哈希补成描述（零 VLM）。
+
+        场景：会话合并 / 上下文压缩类插件在 llm_request 阶段用历史重建请求时，会把被回复
+        消息的媒体**重新下载成另一个临时文件**（download_10.jpg → download_11.jpg）。此刻
+        链上已无对应元素，空占位只以**文本**形式留在回复引用的 content 里；框架随后在 agent
+        内部渲染该元素、看到 `caption is None` → **触发官方 VLM 付费调用**。
+
+        这里只做**缓存命中**的补齐（md5 优先、dHash 兜底），**不发起任何新识别**：
+        拿不到元素就拿不到「跳过标记」，贸然识别会破坏用户"省这笔 VLM"的配置意图。
+        """
+        fixed = 0
+        for p in getattr(req, "user_prompt", []) or []:
+            text = getattr(p, "content", "") or ""
+            if "[" not in text:
+                continue
+            matches = list(_EMPTY_OFFICIAL_RE.finditer(text))
+            if not matches:
+                continue
+            out, last = [], 0
+            for m in matches:
+                kind, path = m.group(1), (m.group(2) or "").strip()
+                if not path:
+                    continue                      # 无路径无从查证（官方 Sticker 占位无路径）
+                data = await self._read_media_bytes(path)
+                if not data:
+                    continue
+                md5 = hashlib.md5(data).hexdigest()
+                desc = await self._cache_get(md5)
+                if not desc:
+                    ph = self._phash_of_bytes(data)
+                    desc = self._phash_nearest(ph)
+                    if desc:
+                        await self._cache_set(md5, desc)   # 顺手把新文件也登记进缓存
+                if not desc:
+                    continue
+                out.append(text[last:m.start()])
+                out.append(f"[Sticker {desc}]" if kind == "Sticker"
+                           else f"[Image {desc}, file_path: {path}]")
+                last = m.end()
+                fixed += 1
+            if out:
+                out.append(text[last:])
+                p.content = "".join(out)
+        if fixed:
+            logger.info(f"空占位按文件内容补齐 <{sid}>：{fixed} 个（命中缓存／同图指纹，零 VLM）")
+        return fixed
 
     async def _cache_get(self, md5: str) -> Optional[str]:
         try:
