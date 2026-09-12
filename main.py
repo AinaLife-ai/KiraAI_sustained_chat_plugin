@@ -32,7 +32,7 @@ from core.chat.message_utils import KiraMessageEvent, KiraMessageBatchEvent
 from core.chat import KiraIMMessage, User, Group, Session, MessageChain
 from core.provider import LLMRequest, LLMResponse
 from core.chat.message_elements import Text, Image, Reply, Sticker, Forward, Record
-from queue_merge import BatchMergeScheduler
+from queue_merge import BatchMergeScheduler, restore_messages_to_buffer
 from media_recognize import ParallelMediaRecognizer
 from chat_enhance import ChatEnhanceEngine, _safe_int, _safe_float
 
@@ -1766,14 +1766,22 @@ class DebouncePlugin(BasePlugin):
 
     @on.im_batch_message(priority=Priority.HIGH)
     async def on_queue_merge_batch(self, event: KiraMessageBatchEvent, *_):
-        # 停窗后迟到的「纯持续命中」批次直接拦截：其触发完全来自持续命中，
-        # 不应在 AI 已终止本轮后再引起一次回复（消息仍在缓冲，上下文不丢）
+        # 停窗后迟到的「纯持续命中」批次：**不回一轮，但消息必须留住**
         if event.is_group_message() and self.sustain_stopped.get(event.sid):
             hit_ids = self.sustain_hit_ids.get(event.sid) or set()
             mentioned = [m for m in (getattr(event, "messages", None) or [])
                          if getattr(m, "is_mentioned", False)]
             if mentioned and all(getattr(m, "message_id", None) in hit_ids for m in mentioned):
-                logger.debug(f"[Sustain] 群 {event.sid} 已停窗，拦截纯持续命中批次 {event.event_id}")
+                # ⚠ 批次到达插件层时，消息**已经被框架 flush 出会话缓冲**了
+                # （flush_session_messages 会先 buffer.flush() 弹出全部）——只 stop 不还原，
+                # 这几条消息就彻底消失：既不会进 LLM、也不在缓冲里，之后任何一轮都看不到
+                # （_stop_sustain_round 里写的"消息仍在缓冲"只对**还没 flush** 的批次成立）。
+                # 这里保持"不回一轮"的语义不变，但把消息原样放回缓冲头部 → 退成「前文」，
+                # 等下次真实唤醒随批次一起送进 LLM（内容不丢，只是不再触发回复）。
+                n = restore_messages_to_buffer(self.ctx, event.sid,
+                                               list(getattr(event, "messages", None) or []), event)
+                logger.debug(f"[Sustain] 群 {event.sid} 已停窗，持续命中批次 {event.event_id} "
+                             f"的 {n} 条消息转入前文（不回一轮）")
                 event.stop()
                 return
         await self.merge_scheduler.on_batch_message(event)
