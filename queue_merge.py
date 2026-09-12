@@ -168,6 +168,9 @@ class BatchMergeScheduler:
 
         # per-sid 状态
         self._inflight: dict[str, str] = {}          # sid -> event_id（当前正在处理的批次）
+        # sid -> 该批次的事件对象：用来判断"这一轮是不是已经被停掉/结束了"
+        # （事件被 stop() 之后框架不会再有任何收尾事件 → 不能傻等 stall 兜底）
+        self._inflight_event: dict[str, object] = {}
         self._inflight_since: dict[str, float] = {}  # sid -> 最近一次 LLM 活动时间（卡死兜底用）
         self._final_marked: set[str] = set()         # 该 sid 的 in-flight 批次已进入最后一步
         self._pending: dict[str, list[PendingBatch]] = {}   # sid -> 待推送队列
@@ -195,6 +198,7 @@ class BatchMergeScheduler:
             # 外部批次（core trigger/flush 创建）extra 默认 None，判空后再取标记（与 S 版对齐）
             if event.extra and event.extra.get("_qm_self"):
                 self._inflight[sid] = event.event_id
+                self._inflight_event[sid] = event
                 self._inflight_since[sid] = time.time()
                 self._log(sid, f"自发布批次 {event.event_id} 直接放行（_qm_self）")
                 return
@@ -218,6 +222,7 @@ class BatchMergeScheduler:
             else:
                 # 空闲 -> 放行
                 self._inflight[sid] = event.event_id
+                self._inflight_event[sid] = event
                 self._inflight_since[sid] = time.time()
                 self._log(sid, f"放行批次 {event.event_id}")
 
@@ -253,10 +258,27 @@ class BatchMergeScheduler:
         need_push = False
         async with self._lock:
             # 锁内只判定；真正的二次校验在 _push_pending 锁内再做（双保险）
-            if self._inflight.get(sid) == event.event_id and sid in self._final_marked:
+            # 本轮被谁 stop() 了（停止词 / 其它插件掐停）：框架此后**不会**再有
+            # ON_LLM_RESPONSE 或工具边界，_final_marked 永远不会置位 —— 不能傻等
+            # inflight_stall_timeout（默认约 180s），当场就推 pending。
+            if self._inflight.get(sid) == event.event_id and (
+                    sid in self._final_marked or self._is_stopped(event)):
                 need_push = True
         if need_push:
             await self._push_pending(sid, event.event_id)
+
+    @staticmethod
+    def _is_stopped(event) -> bool:
+        """该批次事件是否已经被 stop()（= 这一轮不会再有任何收尾事件）。
+
+        框架的钩子循环/消费者只看 `event.is_stopped` 就 break，被停掉的那一轮不会再有
+        ON_LLM_RESPONSE / ON_TOOL_RESULT / ON_STEP_RESULT —— 单靠 _final_marked 判断
+        "已收尾"会让 in-flight 一直挂着，pending 只能等 stall 兜底（默认约 180s）。
+        """
+        try:
+            return bool(getattr(event, "is_stopped", False))
+        except Exception:
+            return False
 
     def _is_last_step(self, resp: LLMResponse) -> bool:
         """agent_step_index 是否已达最大步数（框架最后一步）。
@@ -295,6 +317,7 @@ class BatchMergeScheduler:
         """三分支推送决策（须持有 _lock）：返回要发布的合并批次，状态已更新。"""
         pending = self._pending.pop(sid, [])
         self._inflight.pop(sid, None)
+        self._inflight_event.pop(sid, None)
         self._inflight_since.pop(sid, None)
         self._final_marked.discard(sid)
         if not pending:
@@ -326,6 +349,7 @@ class BatchMergeScheduler:
             self._pending.pop(sid, None)
         merged = self._build_merged_batch(to_merge)
         self._inflight[sid] = merged.event_id
+        self._inflight_event[sid] = merged
         self._inflight_since[sid] = time.time()
         return merged
 
@@ -490,7 +514,11 @@ class BatchMergeScheduler:
                 if not pending:
                     continue
                 inflight = self._inflight.get(sid)
-                if inflight and sid not in self._final_marked:
+                if inflight and self._is_stopped(self._inflight_event.get(sid)):
+                    # 本轮已经被停掉（停止词 / 其它插件掐停）：不会再有任何收尾事件，
+                    # 不必等 stall 兜底，直接走下面的推送决策
+                    self._log(sid, "in-flight 已被 stop，不等 stall 直接推送 pending")
+                elif inflight and sid not in self._final_marked:
                     # in-flight 仍在处理（未到最后一步）
                     # 卡死判定：自最后一次 LLM 活动（on_llm_response 心跳，含工具中间步）
                     # 起超过 inflight_stall_timeout 仍无动静 —— LLM 挂起/任务崩溃/被其他插件
@@ -541,6 +569,7 @@ class BatchMergeScheduler:
                     self._log(sid, f"shutdown 重发 pending 批次 {pb.batch.event_id}")
             self._pending.clear()
             self._inflight.clear()
+            self._inflight_event.clear()
             self._inflight_since.clear()
             self._final_marked.clear()
         if task and not task.done():
