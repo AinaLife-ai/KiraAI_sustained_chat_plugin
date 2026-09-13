@@ -1,4 +1,4 @@
-# KiraAI_sustained_chat_plugin/可持续聊天 v2.5.16
+# KiraAI_sustained_chat_plugin/可持续聊天 v2.5.17
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI_sustained_chat_plugin)
 
@@ -353,6 +353,16 @@ croniter>=1.3.0
 
 <details>
 <summary>更新日志</summary>
+
+### v2.5.17
+- **紧急修复：官方 VLM 保护网实际未生效（`guard_captions` 漏 `await`）**
+  - **问题**：v2.5.16 新增的保护网钩子 `guard_official_vlm` 调用 `guard_captions()` 时**漏了 `await`**——`guard_captions` 是协程，不同步 `await` 就**一行都不会执行**。运行时只留下一条 `RuntimeWarning: coroutine 'ParallelMediaRecognizer.guard_captions' was never awaited`（不抛异常、不影响其它逻辑），所以表现为：**保护网完全失效，官方付费识图照旧发生**，日志里该冒 `[llm] Describing image using …` 还是会冒
+  - **修复**：补上 `await`。一个词的改动，但它是保护网能不能跑起来的开关
+  - **为什么 v2.5.16 的测试没发现**：原测试是**直接 `await p.guard_captions(...)`**，绕过了真正出问题的钩子 `guard_official_vlm`，所以永远绿。本次新增 `tests/test_guard_await.py` 补上这条缝：
+    - **运行时**：通过**真实钩子** `guard_official_vlm` 调用，断言 `caption is None` 的图片/表情真被占成 `""`、已有描述不被动、且**没有 `never awaited` 警告**（bug 时三项全挂）
+    - **静态**：AST 扫全部 async 方法名，找出任何"被当同步调用"（未 `await` / 未包装 / 未收集）的点——这类 bug 不会再溜过去
+  - 附带逐行核对了 S 版全部 5 处同名方法（`enhance.*` / `merger.shutdown` 等）的调用点，确认**仅此一处**漏 `await`
+- 版本 v2.5.16 → v2.5.17
 
 ### v2.5.16
 - **新增「官方 VLM 保护网」**（`guard_framework_vlm`，默认开）：框架自己那条付费识图链路被彻底堵住
