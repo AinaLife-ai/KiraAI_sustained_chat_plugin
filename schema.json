@@ -937,7 +937,7 @@
       "enabled": {
         "type": "switch",
         "name": "启用检测",
-        "default": true,
+        "default": false,
         "hint": "时间窗内被 @ 次数达阈值时通知 bot"
       },
       "window_seconds": {
