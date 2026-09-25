@@ -807,29 +807,34 @@ class DebouncePlugin(BasePlugin):
 
         ⚠ 畸形一律返回 False（保守）：宁可窗口多开一轮，也绝不因解析失败
           误杀窗口。旧行为也是 False ⇒ 畸形输入零行为回归。
+
+        ⚠ **触发面刻意收窄**：只认「有 <msg> 且全为空」。没有任何 <msg> 的响应
+          （纯 root 动作标签 / 裸文本）一律**不**判静默 —— 保持旧行为，避免把
+          `stop_on_ai_empty`（配置说明写的是"仅包含空消息"）的触发面扩大。
         """
         t = self.visible_output(xml)
         if not t.strip():
-            return True                       # 完全没内容（含空响应）
+            return True                       # 完全没内容（含空响应/纯空白）
         try:
             root = ET.fromstring(f"<root>{t}</root>")
         except Exception:
             return False                      # 畸形 ⇒ 保守，不判静默
         msgs = root.findall('msg')
-        if msgs:
-            # msg 之外的裸文本 = 模型把话写在标签外（格式失误、用户收不到）
-            # ⇒ 按「有输出」处理，不当作"本轮静默结束"。
-            # ⚠ 只看 root.text 与子元素 tail：元素**内部**文本属于 msg 内容
-            #   或 root 动作标签的值，不算"裸文本"（否则 <wake_extend>yes</wake_extend>
-            #   会被误判成裸文本）。
-            if (root.text or '').strip():
-                return False
-            if any((c.tail or '').strip() for c in root):
-                return False
-            return all(self._msg_is_empty(m) for m in msgs)
-        # 无 msg 元素：纯 root 动作标签（<ignore>/<wake_extend>/<poke_ignore>）
-        # 不产生用户可见内容 ⇒ 仍算静默；有裸文本则不算
-        return not re.sub(r'<[^>]+>', '', t).strip()
+        if not msgs:
+            # 没有任何 <msg>：纯 root 动作标签（<ignore>/<wake_extend>/…）或裸文本。
+            # 这些**不是**"空消息"语义 ⇒ 维持旧行为（不判静默），
+            # 不把 stop_on_ai_empty 的触发面扩大到"只要没发消息就停窗"。
+            return False
+        # 有 <msg>：先看 msg **之外**有没有裸文本（模型把话写在标签外 ⇒ 用户收不到，
+        # 但模型主观意图是"说了话"）⇒ 当作「有输出」处理，不判静默。
+        # ⚠ 只看 root.text 与子元素 tail：元素**内部**文本属于 msg 内容或
+        #   root 动作标签的值，不算"裸文本"（否则 <wake_extend>yes</wake_extend>
+        #   会被误判成裸文本）。
+        if (root.text or '').strip():
+            return False
+        if any((c.tail or '').strip() for c in root):
+            return False
+        return all(self._msg_is_empty(m) for m in msgs)
 
     def _check_stop_keywords(self, text: str, keywords: List[str]) -> bool:
         if not keywords:
@@ -1802,12 +1807,15 @@ class DebouncePlugin(BasePlugin):
             return
 
         ai_text = (resp.text_response or "").strip()
+        # 一次性算出「可见输出」与「是否静默」供后续复用（避免重复解析 XML）
+        ai_visible = self.visible_output(ai_text)
+        ai_silent = self.is_silent_output(ai_text)
 
         # 聊天增强引擎：存在感记录 + 休眠维持期（仅最终文本回复、且**非静默轮**时）。
         # ★ 必须放在 ai_text 提取**之后**并传静默标志：静默轮（bot 只输出空 msg）
         #   什么都没发出去，不该被当成一次"bot 发言"扣分 / 推进休眠维持期计数。
         #   （旧实现无条件先记，空 msg 停窗的那一轮也被计了一次发言。）
-        self.enhance.on_llm_response(event, resp, silent=self.is_silent_output(ai_text))
+        self.enhance.on_llm_response(event, resp, silent=ai_silent)
         # 休眠维持期次数限制：达上限则结束维持期（wake_max_rounds 生效）
         if not self.enhance.dormant.can_reply(sid):
             self.enhance.dormant._awake_until.pop(sid, None)
@@ -1844,10 +1852,10 @@ class DebouncePlugin(BasePlugin):
                 else:
                     should_stop = False
                     stop_reason = ""
-                    if self.dm_stop_on_ai_empty and self.is_silent_output(ai_text):
+                    if self.dm_stop_on_ai_empty and ai_silent:
                         should_stop = True
                         stop_reason = "空消息"
-                    elif self._check_stop_keywords(self.visible_output(ai_text), self.dm_stop_on_ai_keywords):
+                    elif self._check_stop_keywords(ai_visible, self.dm_stop_on_ai_keywords):
                         should_stop = True
                         stop_reason = "AI停止关键词"
 
@@ -1887,7 +1895,7 @@ class DebouncePlugin(BasePlugin):
         # === 群聊持续对话 ===
         if event.is_group_message() and self.sustain_enabled and self._is_sustain_allowed(sid):
             should_stop = False
-            if self.stop_on_ai_empty and self.is_silent_output(ai_text):
+            if self.stop_on_ai_empty and ai_silent:
                 if self.sustain_retry_on_empty:
                     # 空 msg 只是"这次不回"：评分达标才重开窗口等评分补上再触发；
                     # 评分不足则停止窗口（防概率=1 时空消息无限重开循环）
@@ -1911,7 +1919,7 @@ class DebouncePlugin(BasePlugin):
                     return
                 should_stop = True
                 logger.debug(f"[Sustain] AI 输出空消息，停止窗口: {sid}")
-            elif self._check_stop_keywords(self.visible_output(ai_text), self.stop_on_ai_keywords):
+            elif self._check_stop_keywords(ai_visible, self.stop_on_ai_keywords):
                 should_stop = True
                 logger.debug(f"[Sustain] AI 回复包含停止关键词，停止窗口: {sid}")
 

@@ -290,7 +290,6 @@ SCENARIOS = [
 
 async def main():
     plugin_dirs = [Path(p) for p in sys.argv[1:]] or [HERE.parent]
-    rc = 0
     for plugin_dir in plugin_dirs:
         print(f"\n===== 插件目录: {plugin_dir} =====")
         try:
@@ -298,7 +297,6 @@ async def main():
             plugin = make_plugin(mod)
         except Exception as e:  # noqa: BLE001
             check(f"加载插件失败: {e}", False)
-            rc = 1
             continue
         for title, fn in SCENARIOS:
             print(f"\n---------- {title} ----------")
@@ -316,7 +314,6 @@ async def main():
     n_fail = sum(1 for _, ok in results if not ok)
     print(f"\n===== {len(results) - n_fail}/{len(results)} 通过 =====")
     sys.exit(1 if n_fail else 0)
-
 
 if __name__ == "__main__":
     asyncio.run(main())

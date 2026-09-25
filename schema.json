@@ -212,7 +212,7 @@
         "name": "AI空消息停止持续回复（群聊）",
         "type": "switch",
         "default": true,
-        "hint": "当 AI 输出仅包含空消息（<msg/> 或 <msg></msg>）时，自动停止持续对话"
+        "hint": "当 AI 本轮只输出空消息（<msg/>、<msg />、<msg></msg>、空白子元素等任意写法，允许前面带 <reasoning> 推理块）时，自动停止持续对话"
       },
       "sustain_mode": {
         "name": "群聊持续回复模式",
@@ -349,7 +349,7 @@
         "name": "AI空消息停止（私聊）",
         "type": "switch",
         "default": true,
-        "hint": "AI 输出 <msg/> 或 <msg></msg> 时停止持续对话"
+        "hint": "AI 本轮只输出空消息（<msg/>、<msg />、<msg></msg>、空白子元素等任意写法，允许前面带 <reasoning> 推理块）时停止持续对话"
       },
       "dm_allowed_users": {
         "name": "私聊白名单（sid）",
