@@ -41,7 +41,10 @@ SID = "qq:gm:10001"
 
 # --------------------------------------------------------------------- 静态
 CALL_WRAPPERS = {"create_task", "ensure_future", "gather", "wait_for", "shield",
-                 "run_coroutine_threadsafe", "run_until_complete", "to_thread"}
+                 "run_coroutine_threadsafe", "run_until_complete", "to_thread",
+                 # 插件自有的协程包装器（内部 asyncio.create_task + 在飞去重）：
+                 # JEV 后台判定统一经它发射，与 create_task 同语义
+                 "_jev_spawn"}
 # 变量名像"协程/任务/未来"的赋值 = 故意收集后统一 await
 import re as _re
 CORO_VAR = _re.compile(r"(?i)(coro|task|future|fut|awaitable|awaitables)")

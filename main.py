@@ -22,7 +22,7 @@ if _PLUGIN_DIR not in sys.path:
 # 热重载只重新 import main.py，sys.modules 里缓存的同目录模块不会更新；
 # 强制重载，避免改了 queue_merge / media_recognize / chat_enhance 后热重载不生效（AttributeError 等）
 import importlib
-for _m in ("queue_merge", "media_recognize", "chat_enhance"):
+for _m in ("queue_merge", "media_recognize", "chat_enhance", "jev"):
     if _m in sys.modules:
         try:
             importlib.reload(sys.modules[_m])
@@ -37,6 +37,7 @@ from core.chat.message_elements import Text, Image, Reply, Sticker, Forward, Rec
 from queue_merge import BatchMergeScheduler, restore_messages_to_buffer
 from media_recognize import ParallelMediaRecognizer
 from chat_enhance import ChatEnhanceEngine, _safe_int, _safe_float
+import jev as _jev_mod
 
 try:
     from croniter import croniter
@@ -53,6 +54,19 @@ _SELF_PLUGIN_ID = "sustained-chat"
 # 沿同一任务链透传 —— tag 处理器据此拿到**本次响应**的 sid，不再依赖全局标量。
 _RESP_SID: "contextvars.ContextVar[Optional[str]]" = contextvars.ContextVar(
     "kira_sustained_chat_resp_sid", default=None)
+
+# JEV 默认场景指令（用户可在 section_jev 自定义；criteria 固定在 jev.TRIGGER_CRITERIA）
+_JEV_WATCH_PROMPT = (
+    "你是群聊机器人的沉默守望裁判。机器人刚刚主动选择沉默（输出空消息）结束了上一轮对话，"
+    "之后群里又来了一些新消息（见对话内容）。判断机器人现在是否应该重新开口回复。"
+    "只有在新消息明确期待/适合它回应时才选 reply（向它提问、延续它参与的话题、需要它安抚解释等）；"
+    "用户间闲聊、表情互动、与它无关的寒暄都选 wait。"
+)
+_JEV_TRIGGER_PROMPT = (
+    "你是群聊机器人的插话裁判。机器人在旁观群消息，请判断它是否应该主动回复对话内容里的新消息。"
+    "只有内容明显值得回应（提问、分享、延续它的话题、场面需要它）才选 reply；"
+    "日常寒暄、表情、琐碎闲聊选 wait。"
+)
 
 
 class DebouncePlugin(BasePlugin):
@@ -176,6 +190,53 @@ class DebouncePlugin(BasePlugin):
         # 空 msg 后评分补上再触发（默认关）：bot 空 msg 只是"这次不回"，不是"这轮结束"
         self.dm_retry_on_empty = bool(dm_sustain.get("dm_retry_on_empty", False))
         self.dm_k_prob_enabled = dm_sustain.get("dm_k_prob_enabled", False)
+
+        # ========== 从 section_jev 读取 JEV 触发决策配置（可选，默认全关=旧行为） ==========
+        jev_sec = cfg.get("section_jev", {}) or {}
+        self.jev_enabled = bool(jev_sec.get("jev_enabled", False))
+        # 判定后端：jev=TypeSafe System-One 决策模型（默认）；aux_llm=用 webui 已注册的
+        # 小模型做同类判断（生成式路径，延迟/成本更高，schema hint 已明示）
+        self.jev_backend = str(jev_sec.get("jev_backend") or "jev").strip().lower()
+        if self.jev_backend not in ("jev", "aux_llm"):
+            self.jev_backend = "jev"
+        self.jev_models = [str(x) for x in (jev_sec.get("jev_models") or []) if str(x).strip()]
+        self.jev_base_url = str(jev_sec.get("jev_base_url") or "").strip()
+        self.jev_api_key = str(jev_sec.get("jev_api_key") or "").strip()
+        self.jev_model_name = str(jev_sec.get("jev_model_name") or "").strip()
+        self.jev_timeout = max(0.5, _safe_float(jev_sec.get("jev_timeout_ms"), 6000) / 1000.0)
+        self.jev_min_confidence = _safe_float(jev_sec.get("jev_min_confidence"), 0.0)
+        # 空停守望：停窗后，把停窗期间新积攒的消息批交 JEV 判断是否重新开口（续窗）。
+        # 守望范围：ai_empty=仅空消息停止后；ai_stop=空消息+AI停止词（默认，对续窗
+        # 帮助全覆盖 AI 侧停止）；all=再含用户停止词（最激进，用户明确喊停后也守望）
+        self.jev_watch_enabled = bool(jev_sec.get("jev_watch_enabled", False))
+        self.jev_watch_scope = str(jev_sec.get("jev_watch_scope") or "ai_stop").strip().lower()
+        if self.jev_watch_scope not in ("ai_empty", "ai_stop", "all"):
+            self.jev_watch_scope = "ai_stop"
+        self.jev_watch_cooldown = _safe_float(jev_sec.get("jev_watch_cooldown"), 30.0)
+        # 概率/评分触发点参与模式：off / confirm（命中后复核否决）/ boost（未命中补触发）
+        # / confirm_boost（双向）。统一规则：JEV 置信度 < min_confidence ⇒ 弃权，机械结果照旧
+        self.jev_proactive_mode = str(jev_sec.get("jev_proactive_mode") or "off")
+        self.jev_sustain_mode = str(jev_sec.get("jev_sustain_mode") or "off")
+        self.jev_dm_mode = str(jev_sec.get("jev_dm_mode") or "off")
+        self.jev_watch_prompt = str(jev_sec.get("jev_watch_prompt") or "").strip() or _JEV_WATCH_PROMPT
+        self.jev_trigger_prompt = str(jev_sec.get("jev_trigger_prompt") or "").strip() or _JEV_TRIGGER_PROMPT
+        self._jev_client = None       # JevClient 或 LlmJudgeClient（接口一致）
+        self._jev_links: list = []
+        self._jev_llm_clients: list = []
+        self._jev_link_displays: list = []
+        self._jev_resolve_logged = False
+        # 空停守望状态（按 sid）：世代号 / 停窗时已在缓冲的消息 id 集 / 顺延 Event /
+        # 顺延任务 / 新到消息计数 / 满即推标记 / 冷却截止
+        self._watch_gen: dict[str, int] = {}
+        self._watch_since: dict[str, set] = {}
+        self._watch_events: dict[str, asyncio.Event] = {}
+        self._watch_tasks: dict[str, asyncio.Task] = {}
+        self._watch_count: dict[str, int] = {}
+        self._watch_full: dict[str, bool] = {}
+        self._watch_cooldown_until: dict[str, float] = {}
+        # JEV 后台判定在飞去重（(sid, scene)），同一会话同一场景不并发判断
+        self._jev_inflight: set = set()
+        self._jev_bg_tasks: set = set()
 
         # ========== 从 section_scheduled 读取定时任务配置 ==========
         scheduled = cfg.get("section_scheduled", {})
@@ -339,6 +400,17 @@ class DebouncePlugin(BasePlugin):
             if self.dm_tool_blacklist:
                 logger.info(f"[Debounce] 私聊工具黑名单: {self.dm_tool_blacklist} (mode={self.dm_tool_blacklist_mode})")
             logger.info(f"[Debounce] 私聊重试配置: user_stop_retry={self.dm_retry_on_user_stop}, ai_stop_retry={self.dm_retry_on_ai_stop}")
+        if self.jev_enabled:
+            logger.info(
+                f"[JEV] 触发决策已启用: watch={self.jev_watch_enabled}(cooldown={self.jev_watch_cooldown:.0f}s) "
+                f"proactive={self.jev_proactive_mode} sustain={self.jev_sustain_mode} dm={self.jev_dm_mode}, "
+                f"timeout={self.jev_timeout:.1f}s, min_conf={self.jev_min_confidence:.2f}"
+            )
+            # 提前解析链路（失败只记日志，运行期懒重试）
+            try:
+                self._jev_resolve_links()
+            except Exception as e:
+                logger.warning(f"[JEV] 初始化解析模型链路失败: {e}")
         if self.scheduled_enabled:
             logger.info(f"[Debounce] 定时任务已启用: type={self.scheduled_type}, sessions={len(self.scheduled_sessions)}, max_per_round={self.scheduled_max_per_round}")
             if self.scheduled_type == "interval":
@@ -500,6 +572,16 @@ class DebouncePlugin(BasePlugin):
 
         # 清理合并调度器（重发 pending + 取消 tick）
         await self.merge_scheduler.shutdown()
+        # JEV：解除全部空停守望任务 + 后台判定任务
+        for _sid in list(self._watch_tasks):
+            self._watch_disarm(_sid)
+        for _t in list(self._jev_bg_tasks):
+            if not _t.done():
+                _t.cancel()
+        if self._jev_bg_tasks:
+            await asyncio.gather(*self._jev_bg_tasks, return_exceptions=True)
+        self._jev_bg_tasks.clear()
+        self._watch_events.clear()
         # 关闭聊天增强引擎（await 等待 prune 任务退出）
         await self.enhance.shutdown()
         logger.info("[Debounce] 插件已终止")
@@ -904,8 +986,11 @@ class DebouncePlugin(BasePlugin):
             # （对齐 _stop_sustain_round；否则残留 batch_started 会让后续
             #  非唤醒消息被当作批次消息重置顺延 → 顺延到点 flush 进 LLM，
             #  出现"窗口已关但仍是可回状态"的误触发）
-            self.batch_started.pop(sid, None)
-            self.batch_count.pop(sid, None)
+            # ★ 但同 _stop_sustain_round：在途批次若含真实唤醒（超时瞬间恰好
+            #   有 @/引用回复在顺延），必须保留照常 flush，绝不清掉真唤醒批次。
+            if not self._pending_batch_has_real_wake(sid):
+                self.batch_started.pop(sid, None)
+                self.batch_count.pop(sid, None)
             logger.debug(f"[Sustain] 群 {sid} 持续窗口超时结束（保留计数 {self.sustain_count.get(sid, 0)}）")
 
     def _clear_sustain_window(self, sid: str, keep_count: bool = False):
@@ -926,6 +1011,33 @@ class DebouncePlugin(BasePlugin):
         """完全清除群聊持续状态（含连续计数）。"""
         self._clear_sustain_window(sid, keep_count=False)
 
+    def _pending_batch_has_real_wake(self, sid: str) -> bool:
+        """当前顺延中的批次是否含「真实唤醒」消息（@/唤醒词/引用回复）。
+
+        判定：会话缓冲内存在 is_mentioned 且 message_id **不在** sustain_hit_ids
+        的消息（持续命中消息虽也被标 mentioned，但 id 都在 hit_ids 里）。
+        任何异常 → True（保守保留：宁可多回一轮，绝不丢真唤醒）。
+
+        用途：停窗/窗口超时清理批次状态前的守卫 —— 撤销语义只针对「纯持续命中」
+        批次，真实唤醒是新一轮对话意图，绝不被上一轮的停止连坐。
+        """
+        try:
+            buf = self.ctx.get_buffer(sid)
+            hits = self.sustain_hit_ids.get(sid) or set()
+            for item in list(getattr(buf, "buffer", None) or []):
+                m = getattr(item, "message", item)
+                if m is None:
+                    continue
+                if not getattr(m, "is_mentioned", False):
+                    continue
+                mid = getattr(m, "message_id", None)
+                if mid is not None and mid in hits:
+                    continue                      # 持续命中
+                return True                       # 真实唤醒
+            return False
+        except Exception:
+            return True
+
     async def _stop_sustain_round(self, sid: str):
         """明确终止本轮群聊持续对话（AI 空消息 / AI 停止词 / 用户停止词 / 达上限）。
 
@@ -936,17 +1048,556 @@ class DebouncePlugin(BasePlugin):
           避免停窗前已命中的消息在停窗后仍被追加回复（真实唤醒的批次保留）。
         sustain_hit_ids 不在此处清除：停窗后姗姗来迟的纯持续命中批次（debounce
         尚未 flush）仍需凭它在批次入口拦截；由下次真实唤醒统一清空。
+
+        ★ 2026-10-12 事故修复（真实唤醒被空 msg 停窗连坐）：
+          旧实现无条件 pop batch_started/batch_count —— 若「真实唤醒」消息在
+          stop 前几秒到达、顺延还没走完（ wakeup 已 buffer、batch 已确立），
+          这里的清理会让 _debounce_loop 保险丝永远跳过 flush，该唤醒消息
+          永远滞留缓冲（既不回复也不进任何一轮）。
+          现在：在途批次含真实唤醒 ⇒ 批次状态保留（照常顺延 flush），且本轮
+          **不落 sustain_stopped 闩**（新轮次已在排队，停窗只作用于旧轮；
+          该批次 flush 时若闩还在，on_queue_merge_batch 会误判进停窗拦截）。
         """
+        # 任何原因的明确停窗都先解除旧守望（空 msg 停窗由调用方在返回后重新武装）
+        self._watch_disarm(sid)
         self._clear_sustain_state(sid)
         # 撤销在途批次：停窗后仍在顺延等待中的"命中批次"不再 flush（消息留在
         # 前文缓冲等下次真唤醒；_debounce_loop 保险丝见 batch_started 已清则跳过 flush）。
         # 注意：已满即推（event.flush() 已执行）的批次不在此列，消息已发出无法回收。
-        self.batch_started.pop(sid, None)
-        self.batch_count.pop(sid, None)
-        self.sustain_stopped[sid] = True
+        has_real_wake = self._pending_batch_has_real_wake(sid)
+        if has_real_wake:
+            logger.debug(f"[Sustain] 群 {sid} 停窗，但在途批次含真实唤醒 → 批次照常顺延")
+        else:
+            self.batch_started.pop(sid, None)
+            self.batch_count.pop(sid, None)
+        if not has_real_wake:
+            self.sustain_stopped[sid] = True
         dropped = await self.merge_scheduler.drop_sustain_pending(sid, self.sustain_hit_ids.get(sid))
         if dropped:
             logger.debug(f"[Sustain] 群 {sid} 停窗，丢弃持续命中积压批次 {dropped} 个")
+        return not has_real_wake     # 是否落了 sustain_stopped 闩（守望武装的依据）
+
+    # ========== JEV 触发决策（可选，默认全关；全部后台执行，绝不阻塞消息管线） ==========
+
+    def _jev_resolve_links(self) -> None:
+        """jev_models（webui 已注册提供商模型多选）→ [(base, key, model)] 有序回退链；
+        显式手动字段作最后兜底。displays 只含可读名与端点主机，**绝不含密钥**。"""
+        links, displays = [], []
+        for ref in self.jev_models[:10]:
+            pid, mid = _jev_mod.split_ref(ref)
+            if not pid or not mid:
+                continue
+            try:
+                info = self.ctx.provider_mgr.get_model_info(pid, mid)
+            except Exception:
+                info = None
+            if not info:
+                logger.warning(f"[JEV] 模型组：{ref} 无法解析（提供商/模型已删除？），跳过")
+                continue
+            conf = getattr(info, "provider_config", None) or {}
+            base = _jev_mod._pick(conf, _jev_mod._BASE_KEYS)
+            key = _jev_mod._env(_jev_mod._pick(conf, _jev_mod._KEY_KEYS))
+            # 上游模型名：3.0 用 model_name；2.x 用 model_id 键
+            model = getattr(info, "model_name", None) or getattr(info, "model_id", "") or mid
+            if not base or not key:
+                logger.warning(f"[JEV] 模型组：{ref} 缺少接口地址或密钥，跳过")
+                continue
+            if (base, key, model) in links:
+                continue
+            links.append((base, key, model))
+            host = base.split("://", 1)[-1].split("/", 1)[0]
+            name = getattr(info, "model_name", None) or mid
+            provider = getattr(info, "provider_name", "") or pid
+            displays.append(f"{name} ({provider}) ⇒ {model}@{host}")
+        # 显式手动兜底（密钥非空才成链）
+        if self.jev_api_key:
+            base = self.jev_base_url or _jev_mod.DEFAULT_BASE_URL
+            model = self.jev_model_name or _jev_mod.DEFAULT_MODEL
+            link = (base, self.jev_api_key, model)
+            if link not in links:
+                links.append(link)
+                host = base.split("://", 1)[-1].split("/", 1)[0]
+                displays.append(f"手动 ⇒ {model}@{host}")
+        self._jev_links = links
+        self._jev_link_displays = displays
+
+    def _jev_resolve_llm_clients(self) -> None:
+        """aux_llm 后端：jev_models 引用 → [(ref, LLMModelClient)] 有序回退链。
+
+        双世代同构：`ctx.get_llm_client(model_uuid="provider:model")`（2.x/3.0 同签名）。
+        解析失败/拿不到的档跳过（记日志）；手动兜底三字段仅 JEV 后端用（小模型模式
+        请用模型组下拉选择 webui 已注册模型）。
+        """
+        clients, displays = [], []
+        for ref in self.jev_models[:10]:
+            pid, mid = _jev_mod.split_ref(ref)
+            if not pid or not mid:
+                continue
+            client = None
+            try:
+                client = self.ctx.get_llm_client(model_uuid=ref)
+            except Exception:
+                client = None
+            if client is None:
+                logger.warning(f"[JEV·LLM] 模型组：{ref} 无法取到 LLM 客户端（提供商/模型已删除？），跳过")
+                continue
+            clients.append((ref, client))
+            try:
+                info = self.ctx.provider_mgr.get_model_info(pid, mid)
+                name = getattr(info, "model_name", None) or mid
+                provider = getattr(info, "provider_name", "") or pid
+                displays.append(f"{name} ({provider})")
+            except Exception:
+                displays.append(ref)
+        self._jev_llm_clients = clients
+        self._jev_link_displays = displays
+
+    def _get_jev_client(self):
+        """取判定客户端（懒解析 + 熔断复用）；未启用/无可用链路 → None。
+
+        后端分派：jev → JevClient（systemone 决策模型）；aux_llm → LlmJudgeClient
+        （webui 已注册小模型，生成式路径）。两者 decide_trigger 接口一致。
+        """
+        if not self.jev_enabled:
+            return None
+        if self._jev_client is not None:
+            return self._jev_client if self._jev_client.ready else None
+        if self.jev_backend == "aux_llm":
+            if not getattr(self, "_jev_llm_clients", None):
+                try:
+                    self._jev_resolve_llm_clients()
+                except Exception as e:
+                    logger.warning(f"[JEV·LLM] 解析模型链路失败（本次不启用）: {e}")
+                    return None
+                if not self._jev_resolve_logged:
+                    self._jev_resolve_logged = True
+                    if self._jev_llm_clients:
+                        logger.info(f"[JEV·LLM] 小模型判官链路（生成式，延迟/成本高于 JEV）: "
+                                    f"{' → '.join(self._jev_link_displays)}")
+                    else:
+                        logger.warning("[JEV·LLM] 已启用但没有可用模型（模型组为空），JEV 不生效")
+            if not getattr(self, "_jev_llm_clients", None):
+                return None
+            self._jev_client = _jev_mod.LlmJudgeClient(
+                self._jev_llm_clients, self.jev_timeout, self.jev_min_confidence, logger)
+            return self._jev_client
+        if not self._jev_links:
+            try:
+                self._jev_resolve_links()
+            except Exception as e:
+                logger.warning(f"[JEV] 解析模型链路失败（本次不启用）: {e}")
+                return None
+            if not self._jev_resolve_logged:
+                self._jev_resolve_logged = True
+                if self._jev_links:
+                    logger.info(f"[JEV] 决策链路: {' → '.join(self._jev_link_displays)}")
+                else:
+                    logger.warning("[JEV] 已启用但没有可用链路（模型组为空且手动兜底未填），JEV 不生效")
+        if not self._jev_links:
+            return None
+        cfg = _jev_mod.JevConfig(enabled=True, links=self._jev_links,
+                                 timeout=self.jev_timeout,
+                                 min_confidence=self.jev_min_confidence)
+        self._jev_client = cfg.client(logger)
+        return self._jev_client
+
+    @staticmethod
+    def _jev_mode_has(mode: str, kind: str) -> bool:
+        """模式串是否含 confirm/boost 语义（off/confirm/boost/confirm_boost）。"""
+        mode = (mode or "off").strip().lower()
+        if kind == "confirm":
+            return mode in ("confirm", "confirm_boost")
+        if kind == "boost":
+            return mode in ("boost", "confirm_boost")
+        return False
+
+    def _render_msgs_for_jev(self, messages: list, max_msgs: int = 10,
+                             per_msg: int = 300, total: int = 2000) -> str:
+        """把消息列表渲染成 JEV state 文本（昵称: 内容；媒体占位；从旧侧丢，保最新）。"""
+        lines = []
+        for m in messages[-max_msgs:]:
+            try:
+                nick = getattr(getattr(m, "sender", None), "nickname", "") or "?"
+                parts = []
+                for elem in (getattr(m, "chain", None) or []):
+                    if isinstance(elem, Text):
+                        parts.append(elem.text or "")
+                    elif isinstance(elem, Image):
+                        parts.append(f"[图片 {elem.caption}]" if getattr(elem, "caption", None) else "[图片]")
+                    elif isinstance(elem, Sticker):
+                        parts.append(f"[表情包 {elem.caption}]" if getattr(elem, "caption", None) else "[表情包]")
+                    elif isinstance(elem, Record):
+                        parts.append("[语音]")
+                    elif isinstance(elem, Forward):
+                        parts.append("[转发消息]")
+                    elif isinstance(elem, Reply):
+                        parts.append("[引用回复]")
+                text = "".join(parts).strip()
+                if not text:
+                    continue
+                lines.append(f"[{nick}] {text[:per_msg]}")
+            except Exception:
+                continue
+        out = "\n".join(lines)
+        if len(out) > total:
+            out = out[-total:]     # 从旧侧丢，保最新
+        return out
+
+    async def _jev_judge(self, sid: str, state: str, scene: str):
+        """一次 JEV 触发判断 → 'reply' / 'wait' / None（失败或弃权）。
+
+        弃权（None）语义统一：机械结果照旧 —— confirm 场景的否决与 boost 场景的
+        补触发都要求 JEV 明确表态且置信度达标（client 内 _abstain 已按
+        min_confidence 过滤）。
+        """
+        client = self._get_jev_client()
+        if client is None or not state:
+            return None
+        instructions = self.jev_watch_prompt if scene == "watch" else self.jev_trigger_prompt
+        try:
+            res = await client.decide_trigger(state, instructions)
+        except Exception:
+            return None
+        if not res or res.get("_abstain"):
+            if res:
+                logger.debug(f"[JEV] {scene} {sid} 低置信弃权（conf={res.get('confidence'):.2f}）")
+            return None
+        choice = res.get("choice")
+        logger.info(
+            f"[JEV] {scene} {sid} 判定 {choice}（conf={res.get('confidence'):.2f} "
+            f"P={res.get('probabilities')} model={res.get('model')}）"
+        )
+        return choice if choice in ("reply", "wait") else None
+
+    def _jev_spawn(self, key, coro) -> None:
+        """后台执行 JEV 相关协程：同 key 在飞去重；任务集合强引用防 GC；异常自吞。"""
+        if key in self._jev_inflight:
+            return
+        self._jev_inflight.add(key)
+
+        async def _runner():
+            try:
+                await coro
+            except Exception as e:
+                logger.warning(f"[JEV] 后台任务异常（{key}）: {type(e).__name__}: {e}")
+            finally:
+                self._jev_inflight.discard(key)
+
+        task = asyncio.create_task(_runner())
+        self._jev_bg_tasks.add(task)
+        task.add_done_callback(self._jev_bg_tasks.discard)
+
+    async def _await_message_in_buffer(self, sid: str, mid, timeout: float = 3.0):
+        """等某条消息真正落进会话缓冲（handle_msg 钩子跑在框架 buffer.add 之前）。
+
+        轮询间隔 20ms，超时 3s；落地返回该消息对象，超时/异常返回 None。"""
+        if mid is None:
+            return None
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                buf = self.ctx.get_buffer(sid)
+                for item in list(getattr(buf, "buffer", None) or []):
+                    m = getattr(item, "message", item)
+                    if m is not None and getattr(m, "message_id", None) == mid:
+                        return m
+            except Exception:
+                return None
+            await asyncio.sleep(0.02)
+        return None
+
+    def _collect_buffer_msgs(self, sid: str, limit: int = 10) -> list:
+        """取会话缓冲里的消息对象列表（末尾 limit 条，新→旧截断）。"""
+        try:
+            buf = self.ctx.get_buffer(sid)
+            msgs = []
+            for item in list(getattr(buf, "buffer", None) or []):
+                m = getattr(item, "message", item)
+                if m is not None:
+                    msgs.append(m)
+            return msgs[-limit:]
+        except Exception:
+            return []
+
+    async def _session_memory_chunks(self, sid: str) -> list:
+        """双世代读会话记忆分块。
+
+        2.x：`session_mgr.fetch_memory(sid)`（同步 SQLite，移出事件循环）；
+        3.0 rc1：会话持久化重做（#360），fetch_memory 移除 ⇒ `get_session(sid,
+        include_content=True)`（异步），`Session.content` 即分块列表。
+        任何失败/无接口 ⇒ []（调用方按"无历史"降级，不炸）。
+        """
+        sm = self.ctx.session_mgr
+        fn = getattr(sm, "fetch_memory", None)
+        if callable(fn):
+            try:
+                return await asyncio.to_thread(fn, sid) or []
+            except Exception:
+                return []
+        get_session = getattr(sm, "get_session", None)
+        if get_session is None:
+            return []
+        try:
+            meta = await get_session(sid, ensure_session=False, include_content=True)
+            content = getattr(meta, "content", None) if meta is not None else None
+            return list(content) if isinstance(content, list) else []
+        except Exception:
+            return []
+
+    async def _write_memory_chunks(self, sid: str, chunks: list) -> None:
+        """双世代写会话记忆分块。
+
+        2.x：`write_memory(sid, chunks)`（同步 SQLite，移出事件循环）；
+        3.0 rc1：`update_session(sid, content=chunks)`（异步，content 整体替换）。
+        """
+        sm = self.ctx.session_mgr
+        fn = getattr(sm, "write_memory", None)
+        if callable(fn):
+            await asyncio.to_thread(fn, sid, chunks)
+            return
+        update_session = getattr(sm, "update_session", None)
+        if update_session is None:
+            raise RuntimeError("session_mgr 无可用记忆写入接口")
+        await update_session(sid, content=chunks)
+
+    async def _dm_state_text(self, sid: str) -> str:
+        """私聊 JEV 判定的 state 文本：取会话记忆最近若干条。"""
+        try:
+            chunks = await self._session_memory_chunks(sid)
+        except Exception:
+            return ""
+        lines = []
+        for chunk in (chunks or [])[-6:]:
+            for m in (chunk or []):
+                try:
+                    c = str(m.get("content") or "").strip()
+                except Exception:
+                    continue
+                if not c:
+                    continue
+                role = "bot" if m.get("role") == "assistant" else "user"
+                lines.append(f"{role}: {c[:300]}")
+        return "\n".join(lines[-10:])[-2000:]
+
+    async def _jev_deferred_trigger(self, sid: str, mid, scene: str, mechanical_hit: bool,
+                                    score_snapshot=None):
+        """概率/持续掷骰点的 JEV 延迟判定（confirm 复核 / boost 补触发）。
+
+        在 handle_msg 里以后台任务方式启动（消息管线零阻塞）：
+        先等消息落地，再拿当前缓冲内容交 JEV；JEV 明确表态（reply/wait 且置信达标）
+        ⇒ 以其为准，否则机械结果照旧。确认触发时 flush 整个会话缓冲
+        （前文+批次，与既有主动触发同语义）；sustain 场景补做命中簿记
+        （计数/hit_ids/关窗保留计数），且触发前复核窗口仍在（窗口外不命中）。
+        """
+        try:
+            m = await self._await_message_in_buffer(sid, mid)
+            if m is None:
+                return
+            state = self._render_msgs_for_jev(self._collect_buffer_msgs(sid))
+            decision = await self._jev_judge(sid, state, scene)
+            trigger = mechanical_hit if decision is None else (decision == "reply")
+            if not trigger:
+                if mechanical_hit and score_snapshot is not None:
+                    # JEV 否决 ⇒ 把评分门 boost 已清零的累计分回补（单调不减：否决期间
+                    # 新消息攒的分不丢；deny/纯概率命中本就没消耗，max 语义无副作用）
+                    self.enhance.score_restore(sid, score_snapshot, is_dm=(scene == "dm"))
+                    logger.debug(f"[JEV] {scene} {sid} 否决 ⇒ 评分回补至快照 {score_snapshot:.1f}")
+                logger.debug(f"[JEV] {scene} {sid} 最终不触发（机械={mechanical_hit}, JEV={decision}）")
+                return
+            if scene == "sustain":
+                # 持续命中语义：窗口必须仍在（窗口外的确认不算命中）
+                if not self._is_in_sustain_window(sid):
+                    logger.debug(f"[JEV] sustain {sid} 判 reply 但窗口已关，不触发")
+                    return
+                if self.max_sustain_replies != -1 and \
+                        self.sustain_count.get(sid, 0) >= self.max_sustain_replies:
+                    return
+                self.sustain_count[sid] += 1
+                if mid is not None:
+                    self.sustain_hit_ids.setdefault(sid, set()).add(mid)
+                self._clear_sustain_window(sid, keep_count=True)
+                logger.info(
+                    f"[JEV] sustain {sid} 判定触发（机械={mechanical_hit} → JEV={decision}），"
+                    f"连续次数 {self.sustain_count[sid]}"
+                )
+            else:
+                logger.info(f"[JEV] {scene} {sid} 判定触发（机械={mechanical_hit} → JEV={decision}）")
+            try:
+                await self.ctx.message_processor.flush_session_messages(sid)
+            except Exception:
+                logger.exception(f"[JEV] {scene} {sid} flush 失败")
+        except Exception as e:
+            logger.warning(f"[JEV] 延迟判定异常（{scene} {sid}）: {type(e).__name__}: {e}")
+
+    # ---------- 空停守望（空 msg 停窗后，JEV 判断后续消息批是否重新开口） ----------
+
+    def _watch_active(self, sid: str) -> bool:
+        """该会话当前是否处于「空停守望」状态（空 msg 停窗 + 守望启用 + 已武装）。"""
+        return bool(
+            self.jev_enabled and self.jev_watch_enabled
+            and self.sustain_stopped.get(sid)
+            and sid in self._watch_since
+        )
+
+    def _watch_disarm(self, sid: str) -> None:
+        """解除守望（真唤醒/新一轮/新停止/terminate）：世代号 +1 使在飞任务自动放弃。
+
+        ⚠ 绝不取消**当前任务自己**：_watch_fire 的 reply 分支在 flush 前调用本方法，
+        若把正在执行的守望任务 cancel 掉，Cancel 会在 flush 的第一个 await 点引爆，
+        把解闩后的 flush 打断（单元桩的 flush 无挂起点不会暴露，真框架有）。
+        当前任务会在 _watch_fire 返回后自然退出（finally 里自清理）。
+        """
+        self._watch_gen[sid] = self._watch_gen.get(sid, 0) + 1
+        self._watch_since.pop(sid, None)
+        self._watch_count.pop(sid, None)
+        self._watch_full.pop(sid, None)
+        t = self._watch_tasks.get(sid)
+        if t is not None and not t.done() and t is not asyncio.current_task():
+            t.cancel()
+        self._watch_tasks.pop(sid, None)
+
+    def _watch_scope_allows(self, reason: str) -> bool:
+        """停止原因是否在守望范围内（jev_watch_scope：ai_empty/ai_stop/all）。
+
+        ai_empty=仅 AI 空消息；ai_stop=空消息+AI 停止词（默认）；all=再含用户停止词。
+        达上限/评分不足/ProviderError 等明确硬停止永不守望（不在 reason 集合里）。
+        """
+        if reason == "ai_empty":
+            return True
+        if reason == "ai_keyword":
+            return self.jev_watch_scope in ("ai_stop", "all")
+        if reason == "user_keyword":
+            return self.jev_watch_scope == "all"
+        return False
+
+    def _arm_watch_after_empty_stop(self, sid: str) -> None:
+        """停窗后武装守望：记录此刻缓冲内容（旧上下文不参与判断）。
+
+        触发范围由 jev_watch_scope 控制（ai_empty 仅空消息 / ai_stop 含 AI 停止词
+        / all 再含用户停止词），调用方已按范围过滤；这里只做武装。"""
+        if not (self.jev_enabled and self.jev_watch_enabled):
+            return
+        if not self._is_sustain_allowed(sid):
+            return
+        self._watch_gen[sid] = self._watch_gen.get(sid, 0) + 1
+        try:
+            buf = self.ctx.get_buffer(sid)
+            self._watch_since[sid] = {
+                getattr(getattr(it, "message", it), "message_id", None)
+                for it in list(getattr(buf, "buffer", None) or [])
+            }
+        except Exception:
+            self._watch_since[sid] = set()
+        self._watch_count[sid] = 0
+        self._watch_full.pop(sid, None)
+        self._watch_cooldown_until.pop(sid, None)
+        logger.info(f"[JEV] 空停守望已武装: {sid}（停窗期间的新消息批将交 JEV 判断是否重新开口）")
+
+    def _watch_track(self, sid: str, event) -> None:
+        """停窗守望期的非唤醒消息：计数 + 武装/重置顺延；满 max_buffer_messages 立即判。"""
+        if not self._watch_active(sid):
+            return
+        # 休眠期内不守望（休眠时段不主动）
+        try:
+            if self.enhance.dormant.in_dormant(self.enhance._now_hhmm(), sid):
+                return
+        except Exception:
+            pass
+        self._watch_count[sid] = self._watch_count.get(sid, 0) + 1
+        if 0 < self.jev_watch_cooldown and \
+                time.time() < self._watch_cooldown_until.get(sid, 0.0):
+            return                                   # 冷却中：只计数不判断
+        if self.max_buffer_messages > 0 and \
+                self._watch_count.get(sid, 0) >= self.max_buffer_messages:
+            self._watch_full[sid] = True             # 满即推：唤醒顺延任务立即判
+        if sid not in self._watch_events:
+            self._watch_events[sid] = asyncio.Event()
+        t = self._watch_tasks.get(sid)
+        if t is None or t.done():
+            self._watch_tasks[sid] = asyncio.create_task(
+                self._watch_loop(sid, self._watch_gen.get(sid, 0)))
+        self._watch_events[sid].set()
+
+    async def _watch_loop(self, sid: str, gen: int) -> None:
+        """守望顺延：最后一条消息后 merge_window 秒无新消息（或满即推）→ 触发判断。"""
+        event = self._watch_events[sid]
+        window = self.merge_window_seconds if self.merge_window_seconds > 0 else self.debounce_interval
+        window = max(0.5, float(window))
+        try:
+            while True:
+                await event.wait()
+                event.clear()
+                while True:
+                    try:
+                        await asyncio.wait_for(event.wait(), timeout=window)
+                        event.clear()
+                        if self._watch_full.get(sid):
+                            break                    # 满即推
+                        # 新消息到达 → 顺延重置（继续等一个完整窗口）
+                    except asyncio.TimeoutError:
+                        break                        # 到点
+                    if self._watch_full.get(sid):
+                        break
+                # 世代/闩锁校验：期间真唤醒或新停止 ⇒ 自动放弃
+                if gen != self._watch_gen.get(sid, -1) or not self.sustain_stopped.get(sid):
+                    return
+                await self._watch_fire(sid, gen)
+                return
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            logger.exception(f"[JEV] 守望顺延异常: {sid}")
+        finally:
+            if self._watch_tasks.get(sid) is asyncio.current_task():
+                self._watch_tasks.pop(sid, None)
+
+    async def _watch_fire(self, sid: str, gen: int) -> None:
+        """守望触发：把停窗后新到消息交 JEV；reply ⇒ 解闩 flush 重新开口。"""
+        try:
+            since = self._watch_since.get(sid) or set()
+            new_msgs = []
+            try:
+                buf = self.ctx.get_buffer(sid)
+                for item in list(getattr(buf, "buffer", None) or []):
+                    m = getattr(item, "message", item)
+                    if m is None:
+                        continue
+                    mid = getattr(m, "message_id", None)
+                    if mid is not None and mid in since:
+                        continue
+                    new_msgs.append(m)
+            except Exception:
+                return
+            # 判过的消息进入 since（下次只判更新的）；清空满即推标记与计数
+            self._watch_since[sid] = since | {
+                getattr(m, "message_id", None) for m in new_msgs}
+            self._watch_count[sid] = 0
+            self._watch_full.pop(sid, None)
+            if not new_msgs:
+                return
+            state = self._render_msgs_for_jev(new_msgs)
+            decision = await self._jev_judge(sid, state, "watch")
+            # 判定期间状态可能已变（真唤醒/新停止）⇒ 再校验
+            if gen != self._watch_gen.get(sid, -1) or not self.sustain_stopped.get(sid):
+                return
+            if decision == "reply":
+                logger.info(
+                    f"[JEV] 空停守望 {sid} 判定 reply：{len(new_msgs)} 条新消息值得回应，重新开口")
+                self.sustain_stopped.pop(sid, None)
+                self.sustain_hit_ids.pop(sid, None)
+                self._watch_disarm(sid)
+                try:
+                    await self.ctx.message_processor.flush_session_messages(sid)
+                except Exception:
+                    logger.exception(f"[JEV] 守望 flush 失败: {sid}")
+            else:
+                self._watch_cooldown_until[sid] = time.time() + self.jev_watch_cooldown
+                logger.debug(
+                    f"[JEV] 空停守望 {sid} 判定 wait/弃权：维持停窗"
+                    f"（冷却 {self.jev_watch_cooldown:.0f}s 内不再判断）"
+                )
+        except Exception as e:
+            logger.warning(f"[JEV] 守望触发异常（{sid}，维持停窗）: {type(e).__name__}: {e}")
 
     # ========== 私聊持续对话 ==========
     def _is_in_dm_sustain(self, sid: str) -> bool:
@@ -1051,6 +1702,10 @@ class DebouncePlugin(BasePlugin):
             _kf = self.enhance.k_prob(sid, is_dm=True)
             _dm_prob *= _kf
         _dm_hit = rand_val < _dm_prob
+        # JEV confirm 模式：评分门 boost 可能清零累计分——先存档快照（否决时回补）
+        _dm_snap = self.enhance.score_snapshot(sid, is_dm=True) if (
+            self.jev_enabled and self._jev_mode_has(self.jev_dm_mode, "confirm")
+        ) else None
         _gate = self.enhance.score_gate(sid, _dm_hit, scope="dm_sustain", is_dm=True)
         logger.debug(
             f"[DM Sustain] 私聊 {sid} 持续判定: 概率 {self.dm_sustain_reply_probability:.2f}"
@@ -1058,6 +1713,22 @@ class DebouncePlugin(BasePlugin):
             f"→ 有效 {_dm_prob:.3f}, 随机 {rand_val:.3f}, 概率命中={_dm_hit}, "
             f"评分门={_gate} → {'触发' if _gate else '未命中'}"
         )
+        # JEV 私聊通路（本循环本就是后台任务，可安全 inline await）：
+        # confirm=命中后复核（wait 则按失败处理）；boost=未命中补判（reply 则触发）；
+        # 弃权/失败 ⇒ 机械结果照旧
+        if self.jev_enabled and self._jev_mode_has(self.jev_dm_mode, "confirm") and _gate:
+            _dec = await self._jev_judge(sid, await self._dm_state_text(sid), "dm")
+            if _dec == "wait":
+                logger.info(f"[DM Sustain] JEV 复核否决主动触发: {sid}")
+                _gate = False
+                if _dm_snap is not None:
+                    self.enhance.score_restore(sid, _dm_snap, is_dm=True)
+                    logger.debug(f"[DM Sustain] 否决 ⇒ 评分回补至快照 {_dm_snap:.1f}")
+        elif self.jev_enabled and self._jev_mode_has(self.jev_dm_mode, "boost") and not _gate:
+            _dec = await self._jev_judge(sid, await self._dm_state_text(sid), "dm")
+            if _dec == "reply":
+                logger.info(f"[DM Sustain] JEV 补触发主动回复: {sid}")
+                _gate = True
         if _gate:
             self.dm_sustain_count[sid] += 1
             count = self.dm_sustain_count[sid]
@@ -1194,8 +1865,8 @@ class DebouncePlugin(BasePlugin):
             logger.error(f"[Scheduler] 无法获取适配器: {adapter_name}")
             return
 
-        # 如果会话无历史，尝试拉取
-        history = self.ctx.session_mgr.fetch_memory(sid)
+        # 如果会话无历史，尝试拉取（双世代记忆接口，见 _session_memory_chunks）
+        history = await self._session_memory_chunks(sid)
         if not history and self.scheduled_fetch_history:
             logger.info(f"[Scheduler] 会话 {sid} 无历史，尝试拉取")
             try:
@@ -1203,9 +1874,9 @@ class DebouncePlugin(BasePlugin):
                 if fetched:
                     chunks = self._flat_to_chunks(fetched)
                     if chunks:
-                        # write_memory 走 SQLite 同步 IO：移出事件循环，防调度周期任务阻塞
-                        await asyncio.to_thread(self.ctx.session_mgr.write_memory, sid, chunks)
-                        history = self.ctx.session_mgr.fetch_memory(sid)
+                        # 记忆写入走 SQLite IO：2.x 同步移出事件循环；3.0 rc1 异步原生
+                        await self._write_memory_chunks(sid, chunks)
+                        history = await self._session_memory_chunks(sid)
                         logger.info(f"[Scheduler] 拉取并写入 {len(chunks)} 条消息")
             except Exception as e:
                 logger.error(f"[Scheduler] 拉取历史失败: {e}")
@@ -1374,7 +2045,11 @@ class DebouncePlugin(BasePlugin):
             mentioned_gate = self.enhance.score_gate(sid, True, scope=scope, is_dm=is_dm)
             if not mentioned_gate:
                 # deny 生效：评分不足时阻止触发，降级为未提及
-                event.is_mentioned = False
+                # ⚠ 必须写 message.is_mentioned：两代框架的 KiraMessageEvent.is_mentioned
+                #   都是**只读 property**（读 message.is_mentioned），直接对 event 赋值会
+                #   AttributeError → 钩子异常吞掉、事件策略停在默认 discard → 整条消息
+                #   被静默丢弃（该分支此前从未真正生效过，属潜伏崩溃）。
+                event.message.is_mentioned = False
                 # P1 修复：_process_media 已按「唤醒」把图片/表情置为待识别（caption=""、
                 # 未打 _media_skip），若此处降级为围观却不回补标记，stage2 仍会对这些
                 # 媒体跑 VLM/STT —— 消息最终不触发 LLM，识别成本全部白付（VLM 泄露）。
@@ -1448,6 +2123,8 @@ class DebouncePlugin(BasePlugin):
             # 新一轮开始：解除终止标志，清空上一轮命中标记
             self.sustain_stopped.pop(sid, None)
             self.sustain_hit_ids.pop(sid, None)
+            # 真实唤醒到达 ⇒ 空停守望立即解除（新一轮接管，守望任务世代作废）
+            self._watch_disarm(sid)
 
         if self.sustain_enabled and event.is_group_message() and not event.is_mentioned and self._is_sustain_allowed(sid):
             if self._is_in_sustain_window(sid):
@@ -1456,7 +2133,10 @@ class DebouncePlugin(BasePlugin):
                 else:
                     text_content = "".join(elem.text for elem in event.message.chain if isinstance(elem, Text))
                     if self._check_stop_keywords(text_content, self.sustain_stop_keywords):
-                        await self._stop_sustain_round(sid)
+                        latched = await self._stop_sustain_round(sid)
+                        # JEV 守望范围 all：用户停止词停窗后也守望（续窗判断交给 JEV）
+                        if latched and self._watch_scope_allows("user_keyword"):
+                            self._arm_watch_after_empty_stop(sid)
                         event.discard()
                         return
 
@@ -1476,6 +2156,10 @@ class DebouncePlugin(BasePlugin):
                                 _sustain_prob *= _k_factor
                             _rand = random.random()
                             _sustain_hit = _rand < _sustain_prob
+                            # JEV confirm 模式：评分门 boost 可能清零累计分——先存档快照
+                            _snap = self.enhance.score_snapshot(sid) if (
+                                self.jev_enabled and self._jev_mode_has(self.jev_sustain_mode, "confirm")
+                            ) else None
                             _gate = self.enhance.score_gate(sid, _sustain_hit, scope="sustain")
                             logger.debug(
                                 f"[Sustain] 群 {sid} 持续判定(per_message): "
@@ -1485,23 +2169,39 @@ class DebouncePlugin(BasePlugin):
                                 f"评分门={_gate} → {'命中' if _gate else '未命中'}"
                             )
                             if _gate:
-                                event.message.is_mentioned = True
-                                self.sustain_count[sid] += 1
-                                _mid = getattr(event.message, "message_id", None)
-                                if _mid is not None:
-                                    self.sustain_hit_ids.setdefault(sid, set()).add(_mid)
-                                self._clear_sustain_window(sid, keep_count=True)
-                                logger.debug(
-                                    f"[Sustain] 群 {sid} 持续对话命中（per_message），连续次数 {self.sustain_count[sid]}"
-                                )
-                                if (
-                                    self.max_sustain_replies != -1
-                                    and self.sustain_count[sid] >= self.max_sustain_replies
-                                ):
+                                if self.jev_enabled and self._jev_mode_has(self.jev_sustain_mode, "confirm"):
+                                    # JEV 复核（后台，零阻塞）：确认后才命中簿记+flush；
+                                    # 弃权/失败 ⇒ 机械命中照旧（由延迟任务内补做）
+                                    self._jev_spawn(
+                                        (sid, "sustain"),
+                                        self._jev_deferred_trigger(
+                                            sid, getattr(event.message, "message_id", None),
+                                            "sustain", True, score_snapshot=_snap))
+                                else:
+                                    event.message.is_mentioned = True
+                                    self.sustain_count[sid] += 1
+                                    _mid = getattr(event.message, "message_id", None)
+                                    if _mid is not None:
+                                        self.sustain_hit_ids.setdefault(sid, set()).add(_mid)
+                                    self._clear_sustain_window(sid, keep_count=True)
                                     logger.debug(
-                                        f"[Sustain] 群 {sid} 已达最大持续次数 {self.max_sustain_replies}，"
-                                        f"AI 回复后将不再开窗"
+                                        f"[Sustain] 群 {sid} 持续对话命中（per_message），连续次数 {self.sustain_count[sid]}"
                                     )
+                                    if (
+                                        self.max_sustain_replies != -1
+                                        and self.sustain_count[sid] >= self.max_sustain_replies
+                                    ):
+                                        logger.debug(
+                                            f"[Sustain] 群 {sid} 已达最大持续次数 {self.max_sustain_replies}，"
+                                            f"AI 回复后将不再开窗"
+                                        )
+                            elif self.jev_enabled and self._jev_mode_has(self.jev_sustain_mode, "boost"):
+                                # JEV 补触发（后台）：机械未命中时补一次语义判定
+                                self._jev_spawn(
+                                    (sid, "sustain"),
+                                    self._jev_deferred_trigger(
+                                        sid, getattr(event.message, "message_id", None),
+                                        "sustain", False))
                     else:
                         # per_round：窗口内只判断第一条；
                         # 未命中：本窗口不再判断；命中：关窗保留计数，等 AI 再开窗
@@ -1519,6 +2219,10 @@ class DebouncePlugin(BasePlugin):
                                     _sustain_prob *= _k_factor
                                 _rand = random.random()
                                 _sustain_hit = _rand < _sustain_prob
+                                # JEV confirm 模式：评分门 boost 可能清零累计分——先存档快照
+                                _snap = self.enhance.score_snapshot(sid) if (
+                                    self.jev_enabled and self._jev_mode_has(self.jev_sustain_mode, "confirm")
+                                ) else None
                                 _gate = self.enhance.score_gate(sid, _sustain_hit, scope="sustain")
                                 logger.debug(
                                     f"[Sustain] 群 {sid} 持续判定(per_round): "
@@ -1528,23 +2232,38 @@ class DebouncePlugin(BasePlugin):
                                     f"评分门={_gate} → {'命中' if _gate else '未命中'}"
                                 )
                                 if _gate:
-                                    event.message.is_mentioned = True
-                                    self.sustain_count[sid] += 1
-                                    _mid = getattr(event.message, "message_id", None)
-                                    if _mid is not None:
-                                        self.sustain_hit_ids.setdefault(sid, set()).add(_mid)
-                                    self._clear_sustain_window(sid, keep_count=True)
-                                    logger.debug(
-                                        f"[Sustain] 群 {sid} 持续对话命中（per_round），连续次数 {self.sustain_count[sid]}"
-                                    )
-                                    if (
-                                        self.max_sustain_replies != -1
-                                        and self.sustain_count[sid] >= self.max_sustain_replies
-                                    ):
+                                    if self.jev_enabled and self._jev_mode_has(self.jev_sustain_mode, "confirm"):
+                                        # JEV 复核（后台，零阻塞）：确认后才命中簿记+flush
+                                        self._jev_spawn(
+                                            (sid, "sustain"),
+                                            self._jev_deferred_trigger(
+                                                sid, getattr(event.message, "message_id", None),
+                                                "sustain", True, score_snapshot=_snap))
+                                    else:
+                                        event.message.is_mentioned = True
+                                        self.sustain_count[sid] += 1
+                                        _mid = getattr(event.message, "message_id", None)
+                                        if _mid is not None:
+                                            self.sustain_hit_ids.setdefault(sid, set()).add(_mid)
+                                        self._clear_sustain_window(sid, keep_count=True)
                                         logger.debug(
-                                            f"[Sustain] 群 {sid} 已达最大持续次数 {self.max_sustain_replies}，"
-                                            f"AI 回复后将不再开窗"
+                                            f"[Sustain] 群 {sid} 持续对话命中（per_round），连续次数 {self.sustain_count[sid]}"
                                         )
+                                        if (
+                                            self.max_sustain_replies != -1
+                                            and self.sustain_count[sid] >= self.max_sustain_replies
+                                        ):
+                                            logger.debug(
+                                                f"[Sustain] 群 {sid} 已达最大持续次数 {self.max_sustain_replies}，"
+                                                f"AI 回复后将不再开窗"
+                                            )
+                                elif self.jev_enabled and self._jev_mode_has(self.jev_sustain_mode, "boost"):
+                                    # JEV 补触发（后台）：机械未命中时补一次语义判定
+                                    self._jev_spawn(
+                                        (sid, "sustain"),
+                                        self._jev_deferred_trigger(
+                                            sid, getattr(event.message, "message_id", None),
+                                            "sustain", False))
                                 else:
                                     logger.debug(f"[Sustain] 群 {sid} 持续对话未命中，本窗口不再判断")
 
@@ -1565,6 +2284,9 @@ class DebouncePlugin(BasePlugin):
                         buffer.pop(count=buffer.get_length()-self.max_unmentioned_messages+1)
                 # 批次已开始：不裁剪（批次内消息只进不出，直到满即推/顺延到点）
                 event.buffer()
+                # JEV 空停守望：空 msg 停窗期间的非唤醒消息计入守望批
+                # （顺延到点/满即推时交 JEV 判断是否重新开口；未武装时零开销）
+                self._watch_track(sid, event)
                 # 预取标记：只有**确定会被送进 LLM 的消息**才打（v2.5.19 收紧作用域）。
                 #   · 批次已开启（_batch_on）→ 本条属本批，必被 flush → 打标记 ✓
                 #   · 前文阶段 → 只是上下文：可能永远等不到唤醒，也可能窗口满被弹掉
@@ -1598,6 +2320,11 @@ class DebouncePlugin(BasePlugin):
                         prob *= _kf
                     _rand = random.random()
                     prob_hit = _rand < prob
+                    # JEV confirm 模式：评分门 boost 可能消耗累计分（清零）——先存档快照，
+                    # 若 JEV 否决则在延迟任务里回补（弃权/确认不动分）
+                    _snap = self.enhance.score_snapshot(sid) if (
+                        self.jev_enabled and self._jev_mode_has(self.jev_proactive_mode, "confirm")
+                    ) else None
                     _gate = self.enhance.score_gate(sid, prob_hit)
                     logger.debug(
                         f"[Sustain] 群 {sid} 积极概率判定: 概率 {self.group_proactive_chat_probability:.2f}"
@@ -1607,10 +2334,27 @@ class DebouncePlugin(BasePlugin):
                     )
                     # 评分补正：评分不足概率命中作废；评分够概率未命中补触发
                     if _gate:
-                        logger.info("[Chat] Triggered proactive chat")
-                        # 本条会被立即推出（连同它的媒体）→ 补预取标记（stage1 末尾调度）
-                        event.message._batch_entered = True
-                        event.flush()
+                        if self.jev_enabled and self._jev_mode_has(self.jev_proactive_mode, "confirm"):
+                            # JEV 复核（后台，零阻塞）：确认后才 flush；弃权/失败 ⇒ 机械命中照旧；
+                            # 否决 ⇒ 回补 boost 消耗的评分（快照在评分门之前存档）
+                            event.message._batch_entered = True
+                            self._jev_spawn(
+                                (sid, "proactive"),
+                                self._jev_deferred_trigger(
+                                    sid, getattr(event.message, "message_id", None),
+                                    "proactive", True, score_snapshot=_snap))
+                        else:
+                            logger.info("[Chat] Triggered proactive chat")
+                            # 本条会被立即推出（连同它的媒体）→ 补预取标记（stage1 末尾调度）
+                            event.message._batch_entered = True
+                            event.flush()
+                    elif self.jev_enabled and self._jev_mode_has(self.jev_proactive_mode, "boost"):
+                        # JEV 补触发（后台）：机械未命中时给一次语义补判，reply 才 flush
+                        self._jev_spawn(
+                            (sid, "proactive"),
+                            self._jev_deferred_trigger(
+                                sid, getattr(event.message, "message_id", None),
+                                "proactive", False))
             else:
                 event.discard()
             return
@@ -1934,6 +2678,7 @@ class DebouncePlugin(BasePlugin):
         # === 群聊持续对话 ===
         if event.is_group_message() and self.sustain_enabled and self._is_sustain_allowed(sid):
             should_stop = False
+            _stop_reason = ""
             if self.stop_on_ai_empty and ai_silent:
                 if self.sustain_retry_on_empty:
                     # 空 msg 只是"这次不回"：评分达标才重开窗口等评分补上再触发；
@@ -1957,13 +2702,19 @@ class DebouncePlugin(BasePlugin):
                     logger.debug(f"[Sustain] 群 {sid} AI 空消息（retry_on_empty），重开窗口等评分补上")
                     return
                 should_stop = True
+                _stop_reason = "ai_empty"
                 logger.debug(f"[Sustain] AI 输出空消息，停止窗口: {sid}")
             elif self._check_stop_keywords(ai_visible, self.stop_on_ai_keywords):
                 should_stop = True
+                _stop_reason = "ai_keyword"
                 logger.debug(f"[Sustain] AI 回复包含停止关键词，停止窗口: {sid}")
 
             if should_stop:
-                await self._stop_sustain_round(sid)
+                latched = await self._stop_sustain_round(sid)
+                # JEV 空停守望（按范围）：ai_empty=仅空消息；ai_stop=空消息+AI停止词（默认）；
+                # all=再含用户停止词。闩真正落下才武装（真唤醒在途未落闩 ⇒ 新轮在即不守望）
+                if latched and self._watch_scope_allows(_stop_reason):
+                    self._arm_watch_after_empty_stop(sid)
                 return
 
             if self.sustain_stopped.get(sid):
@@ -2090,6 +2841,14 @@ class DebouncePlugin(BasePlugin):
                              f"的 {n} 条消息转入前文（不回一轮）")
                 event.stop()
                 return
+            if mentioned:
+                # 批次含真实唤醒（mentioned 非全持续命中）⇒ 新一轮对话意图。
+                # 覆盖竞态：唤醒消息在 stop 闩落下**之前**已进入 QueueMerge pending
+                # 或仍在顺延，stop 之后批次才到这里 —— handle_msg 的唤醒解闩
+                # 只覆盖 stop 之后到达的唤醒，这里对称解闩后放行。
+                self.sustain_stopped.pop(event.sid, None)
+                self.sustain_hit_ids.pop(event.sid, None)
+                logger.debug(f"[Sustain] 群 {event.sid} 停窗批次含真实唤醒，解闩放行（新一轮）")
         await self.merge_scheduler.on_batch_message(event)
 
     @on.llm_response(priority=Priority.HIGH)
