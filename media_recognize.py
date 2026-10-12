@@ -351,6 +351,8 @@ class ParallelMediaRecognizer:
         """
         if not sid:
             return
+        if self._caps_async_api is False:
+            return            # 旧世代同步直读通道本来就工作：零成本短路（不重复探测）
         cached = self._caps_cache.get(sid)
         if self._caps_async_api and cached and time.time() - cached[1] < 30.0:
             return            # rc1：缓存新鲜，不重复读库
