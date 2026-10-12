@@ -37,6 +37,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import inspect
 import os
 import re
 import time
@@ -205,6 +206,11 @@ class ParallelMediaRecognizer:
         # 替换图片（原生多模态收不到图）、切回 vlm_description 后图片无人识别（VLM 被跳过）。
         # 实时读配置走内存缓存（微秒级），无卡顿无延迟，WebUI 保存后立即生效。
 
+        # 会话能力缓存（3.0 rc1 起 get_effective_capabilities 异步化）：
+        # sid -> (caps_dict, ts)；_caps_async_api=None 未探测 / True rc1 异步 / False 旧同步
+        self._caps_cache: dict[str, tuple] = {}
+        self._caps_async_api: Optional[bool] = None
+
         # 动态属性挂载名（沿用并行识图插件协议语义）
         self._media_attr = "_pir_media"
         # 当前回合暂存原媒体的 id 索引（stage3 现场识别用）。
@@ -310,14 +316,65 @@ class ParallelMediaRecognizer:
         if sid:
             sm = getattr(self.ctx, "session_mgr", None)
             if sm is not None and hasattr(sm, "get_effective_capabilities"):
-                try:
-                    eff = sm.get_effective_capabilities(sid, global_caps)
-                    if isinstance(eff, dict):
-                        caps = eff
-                except Exception:
-                    pass
+                if self._caps_async_api:
+                    # 3.0 rc1 起接口异步化：同步上下文不能硬等 ⇒ 读缓存
+                    # （由异步入口 _warm_caps_cache 预热，TTL 30s），无缓存退化全局
+                    cached = self._caps_cache.get(sid)
+                    if cached and time.time() - cached[1] < 30.0:
+                        caps = cached[0]
+                else:
+                    try:
+                        eff = sm.get_effective_capabilities(sid, global_caps)
+                        if isinstance(eff, dict):
+                            caps = eff
+                        elif inspect.isawaitable(eff):
+                            # 3.0 rc1：接口异步化 ⇒ 关协程防 RuntimeWarning，
+                            # 标记走缓存通道（下次起不再创建无用协程）
+                            self._caps_async_api = True
+                            try:
+                                eff.close()
+                            except Exception:
+                                pass
+                            cached = self._caps_cache.get(sid)
+                            if cached and time.time() - cached[1] < 30.0:
+                                caps = cached[0]
+                    except Exception:
+                        pass
         ir = caps.get("image_recognition", {}) if isinstance(caps, dict) else {}
         return ir if isinstance(ir, dict) else {}
+
+    async def _warm_caps_cache(self, sid: Optional[str]) -> None:
+        """异步入口预热会话能力缓存（3.0 rc1 的 get_effective_capabilities 是 async）。
+
+        旧世代（同步接口）调用零成本直接返回；rc1 下按 30s TTL 惰性刷新
+        （SQLite 读在框架连接池上异步执行，每会话每 30s 最多一次，可忽略）。
+        """
+        if not sid:
+            return
+        cached = self._caps_cache.get(sid)
+        if self._caps_async_api and cached and time.time() - cached[1] < 30.0:
+            return            # rc1：缓存新鲜，不重复读库
+        try:
+            sm = getattr(self.ctx, "session_mgr", None)
+            if sm is None or not hasattr(sm, "get_effective_capabilities"):
+                return
+            try:
+                global_caps = self.ctx.config.get_config("bot_config.capabilities", {}) or {}
+            except Exception:
+                global_caps = {}
+            if not isinstance(global_caps, dict):
+                global_caps = {}
+            eff = sm.get_effective_capabilities(sid, global_caps)
+            if inspect.isawaitable(eff):
+                self._caps_async_api = True
+                eff = await eff
+                if isinstance(eff, dict):
+                    self._caps_cache[sid] = (eff, time.time())
+            else:
+                # 旧世代同步接口：直读通道本来就工作，无需缓存（每次调用微秒级）
+                self._caps_async_api = False
+        except Exception:
+            pass
 
     def _native_mode(self, sid: Optional[str] = None) -> bool:
         """运行时实时检测原生多模态模式（KiraAI v2.31.0+）。
@@ -449,6 +506,9 @@ class ParallelMediaRecognizer:
             return 0
         try:
             sid = getattr(getattr(event, "session", None), "sid", None)
+            # 3.0 rc1：会话能力接口异步化 ⇒ 借本条消息的异步钩子预热缓存（30s TTL），
+            # 让 _native_mode 等同步读点拿到会话级覆盖；旧世代内部自检后零成本返回
+            await self._warm_caps_cache(sid)
             # PIR 接管 / native 直传时仍占位（见 docstring）：这里只占位防 F1，
             # 其余处理（暂存/识别）仍由 stage1 的跳过逻辑分流
             self._pir_active()   # 顺带触发 PIR 自动互斥检测（保持原有时机）
@@ -2344,16 +2404,52 @@ def _reencode_jpeg(data_url: str, quality: int) -> Optional[str]:
 _DESC_IMG_PATCHED: list = []   # [(module, original)]，还原用
 
 
+def _is_sticker_library_image(image) -> bool:
+    """该 image 是不是「表情包库」里的文件（data/sticker/ 下）。
+
+    内置「默认表情包」插件（core/plugin/builtin_plugins/sticker，两代框架同构）在
+    用户 webui 手动添加表情包 / 定时扫描未注册表情包时，会用自己的专用 prompt 调
+    desc_img 给表情包生成描述（运行时 from-import，必然拿到本 guard 包装后的版本）。
+    若按聊天口径拦截：缓存命中会写入聊天 prompt 语义的描述（答非所问）；在途/失败
+    收口会返回空串 ⇒ 空描述**永久写入**（scan 不重试已注册文件）；wait_for 还会把
+    原本无超时的调用压上 media_timeout。这些都是对表情包插件的误拦截——
+    表情包库文件**完全绕行**本 guard（不查缓存/不收口/不包超时 = 原生行为）。
+
+    判定只看 file_type=="path" 的本地路径是否在 data/sticker/ 内；
+    任何异常一律 False（不误放行以外的调用）。
+    """
+    try:
+        if getattr(image, "file_type", "") != "path":
+            return False
+        f = getattr(image, "file", None)
+        if not f:
+            return False
+        from core.utils.path_utils import get_data_path
+        sdir = os.path.abspath(os.path.join(str(get_data_path()), "sticker"))
+        af = os.path.abspath(str(f))
+        return af == sdir or af.startswith(sdir + os.sep)
+    except Exception:
+        return False
+
+
 def install_desc_img_guard(recognizer) -> int:
-    """对框架三处 desc_img 引用做幂等包装（见上）。返回新包装的点数。
+    """对框架 desc_img 引用做幂等包装（见上）。返回新包装的点数。
 
     getattr 防御：任一模块/属性不存在就跳过该点；已被包装（含其它实例包装过）
     则跳过（幂等防重入）。
+
+    覆盖清单（双世代）：
+      2.x：core.message_manager（F1 批次渲染）
+      3.0：core.workflow.src.im.message_formatter（F1 批次渲染，3.0 迁至此处）
+      两代共有：core.plugin.builtin_plugins.agent.main（F2 read_file 补读）、
+               core.utils.common_utils（源头；内置表情包插件运行时 from-import 经此，
+               由 _is_sticker_library_image 绕行保护，见上）
     """
     import importlib
     patched = 0
     for modname in (
         "core.message_manager",
+        "core.workflow.src.im.message_formatter",
         "core.plugin.builtin_plugins.agent.main",
         "core.utils.common_utils",
     ):
@@ -2370,6 +2466,10 @@ def install_desc_img_guard(recognizer) -> int:
             image = kwargs.get("image")
             if image is None and len(args) >= 2:
                 image = args[1]
+            # (0) 表情包库文件完全绕行：内置表情包插件的专用 prompt 描述
+            # 不该被聊天口径拦截（缓存错配/空串永久写入/超时缩水），直调原函数
+            if image is not None and _is_sticker_library_image(image):
+                return await _orig(*args, **kwargs)
             # (a) 先查插件 md5/dHash 描述索引，命中直接返回（零 VLM）
             try:
                 if image is not None:

@@ -1255,6 +1255,23 @@ class ChatEnhanceEngine:
     def k_prob(self, sid: str, is_dm: bool = False) -> float:
         return self._get_presence(is_dm).k_prob(sid, time.time())
 
+    # ---- 评分快照/回补（JEV confirm 否决后还原 boost 消耗的评分） ----
+
+    def score_snapshot(self, sid: str, is_dm: bool = False) -> float:
+        """评分快照（原始累计分，不含闲时加分）：JEV 复核前存档。"""
+        return self._get_presence(is_dm).score(sid, time.time())
+
+    def score_restore(self, sid: str, snapshot: float, is_dm: bool = False) -> None:
+        """评分回补：JEV 否决把 boost 已消耗的清零还原——**单调不减**（max 语义，
+        否决期间新消息攒的分不丢）。仅在当前分低于快照时回补差值。"""
+        try:
+            presence = self._get_presence(is_dm)
+            cur = presence._scores.get(sid, 0.0)
+            if cur < snapshot:
+                presence._scores[sid] = float(snapshot)
+        except Exception:
+            pass
+
     def idle_bonus(self, sid: str) -> float:
         is_dm = False  # caller doesn't have context; group fallback
         p = self._get_presence(is_dm)
