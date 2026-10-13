@@ -92,6 +92,30 @@ def _pair_keywords(words, values, default_value: float = 5.0) -> list:
     return out
 
 
+def _debug_enabled(logger) -> bool:
+    """这个 logger 现在会不会真的输出 DEBUG 行（拿不准就 False）。
+
+    ★ 不能写 `logger.DEBUG`：`DEBUG` 是标准库 `logging` **模块**上的常量，
+      **logger 实例没有**这个属性 ⇒ `AttributeError`。
+      线上（2026-10-13 20:04，KiraAI v2.16.1）就是这样：
+      `chat_enhance.py:970` 抛出异常后，`on_im_message` **从这一行整条中断** ——
+      它后面的骚扰检测 / 休眠判定全被跳过（不只是少打一行日志）。
+
+    这里用标准库语义 `isEnabledFor(DEBUG)`；若这个 logger 没有该 API，或调用抛错，
+    保守返回 False（判错的最坏后果只是少打一行 debug 明细，绝不影响功能）。
+    """
+    try:
+        import logging as _logging
+        if hasattr(logger, "isEnabledFor"):
+            return bool(logger.isEnabledFor(_logging.DEBUG))
+        level = getattr(logger, "level", None)
+        if isinstance(level, int):
+            return level <= _logging.DEBUG
+    except Exception:  # noqa: BLE001
+        return False
+    return False
+
+
 def _is_self_message(event) -> bool:
     """判定事件是否为 bot 自己的发言（群聊/私聊一致）。
 
@@ -967,7 +991,7 @@ class ChatEnhanceEngine:
                 _text = ""
             if _text:
                 _delta, _hits = self._get_presence(is_dm).apply_keyword_score(sid, _text)
-                if _delta and logger.DEBUG:
+                if _delta and _debug_enabled(logger):
                     _detail = " ".join(f"{w}{'+' if d > 0 else ''}{d:g}" for w, d in _hits)
                     logger.debug(
                         f"[Enhance] 关键词计分 {sid}: {_delta:+g}（{_detail}）"
