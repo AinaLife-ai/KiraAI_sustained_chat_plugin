@@ -1,4 +1,4 @@
-# KiraAI_sustained_chat_plugin/可持续聊天 v2.7.2
+# KiraAI_sustained_chat_plugin/可持续聊天 v2.7.3
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI_sustained_chat_plugin)
 
@@ -371,6 +371,11 @@ croniter>=1.3.0
 
 <details>
 <summary>更新日志</summary>
+
+### v2.7.3
+
+  - 兼容 KiraAI 3.0 GA 弃用面：`ctx.message_processor.flush_session_messages/handle_im_message` 改走官方新路径（`ctx.flush_session_messages` / `ctx.event_bus.publish`，两代等价）；合成事件构造改双世代字段探测。
+  - 测试桩补齐 ctx 级委托（镜像真 PluginContext）；2.x/3.0 GA 全套件通过。
 
 ### v2.7.2
 

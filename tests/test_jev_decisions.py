@@ -94,6 +94,10 @@ class _Ctx:
         self._buf = buf
         self.message_processor = proc
 
+    async def flush_session_messages(self, sid, **kw):
+        # 镜像真 PluginContext：ctx 级方法就是委托给 message_processor
+        return await self.message_processor.flush_session_messages(sid, **kw)
+
     def get_plugin_data_dir(self):
         return Path("/tmp")
 
