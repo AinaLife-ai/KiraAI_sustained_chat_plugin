@@ -1,4 +1,4 @@
-# KiraAI_sustained_chat_plugin/可持续聊天 v2.7.1
+# KiraAI_sustained_chat_plugin/可持续聊天 v2.7.2
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI_sustained_chat_plugin)
 
@@ -366,11 +366,30 @@ croniter>=1.3.0
 
 ## 📝 版本信息
 
-- 兼容 KiraAI：v2.29.6+（插件图标需 v2.30.0+）；**同时兼容 3.0（含 v3.0.0-rc.1）**
+- 兼容 KiraAI：v2.29.6+（插件图标需 v2.30.0+）；**同时兼容 3.0（含 v3.0.0-rc.1 / rc.2）**
 - 作者：KiraAI + znq19
 
 <details>
 <summary>更新日志</summary>
+
+### v2.7.2
+
+- **修复「禁言感知丢失」：被禁言 / 解除禁言通知被入口的「忽略机器人自己的消息」过滤器整条丢弃**（用户日志实证）。
+  适配器构造 notice 事件时 `sender.user_id` 取的就是 notice 里的 `user_id`，而「bot 自己被禁言」
+  这条通知（`group_ban`，`self_id == user_id`）的 `user_id` **正是 bot 自己** ⇒
+  `message.self_id == sender.user_id` 成立 ⇒ 入口第一道过滤器 `event.discard()` 把它丢掉，
+  QQ增强 注入的 `[System …禁言了你120秒]` 永远进不了 LLM。线上表现：bot 被禁言 120 秒后
+  仍回答用户「我刚才一直正常说话，没收到任何 notification」。
+- 修法（**最小改动，只加一个例外**）：`not getattr(event, "is_notice", False)` ——
+  **notice 事件不参与「自己的消息」判定**。安全依据：
+  ① notice 本就不进存在感/评分/骚扰统计（`chat_enhance._is_system_event()` 对 notice 直接 return），
+  放行不会污染统计；② 无内容的通知仍由紧随其后的「空通知事件过滤」丢弃（该设计保持不变）；
+  ③ bot 自己**发的**群消息（`is_notice=False`）照旧丢弃，对象区分不变。
+- 新增套件 `tests/test_mute_notice_perception.py`（已登记进 `tests/run_tests.py`）：
+  真框架 + 真加载器 + 真插件代码，2.x 与 3.0-rc.2 双世代各 11 项断言 ——
+  修复前，被禁言 / 解除禁言通知的策略是 `discard`（复现线上）；修复后落点为 `buffer`
+  （进会话缓冲 ⇒ LLM 下一批就能看到）；自己消息回声 / 空通知 / 普通用户消息三项行为不变。
+- 版本 v2.7.1 → v2.7.2
 
 ### v2.7.1
 
