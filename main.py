@@ -34,7 +34,7 @@ from core.chat.message_utils import KiraMessageEvent, KiraMessageBatchEvent
 from core.chat import KiraIMMessage, User, Group, Session, MessageChain
 from core.provider import LLMRequest, LLMResponse
 from core.chat.message_elements import Text, Image, Reply, Sticker, Forward, Record
-from queue_merge import BatchMergeScheduler, restore_messages_to_buffer
+from queue_merge import BatchMergeScheduler, restore_messages_to_buffer, elements_kw, adapter_supported_elements
 from media_recognize import ParallelMediaRecognizer
 from chat_enhance import ChatEnhanceEngine, _safe_int, _safe_float
 import jev as _jev_mod
@@ -1423,7 +1423,7 @@ class DebouncePlugin(BasePlugin):
             else:
                 logger.info(f"[JEV] {scene} {sid} 判定触发（机械={mechanical_hit} → JEV={decision}）")
             try:
-                await self.ctx.message_processor.flush_session_messages(sid)
+                await self.ctx.flush_session_messages(sid)
             except Exception:
                 logger.exception(f"[JEV] {scene} {sid} flush 失败")
         except Exception as e:
@@ -1587,7 +1587,7 @@ class DebouncePlugin(BasePlugin):
                 self.sustain_hit_ids.pop(sid, None)
                 self._watch_disarm(sid)
                 try:
-                    await self.ctx.message_processor.flush_session_messages(sid)
+                    await self.ctx.flush_session_messages(sid)
                 except Exception:
                     logger.exception(f"[JEV] 守望 flush 失败: {sid}")
             else:
@@ -1774,7 +1774,7 @@ class DebouncePlugin(BasePlugin):
 
         event = KiraMessageEvent(
             adapter=adapter.info,
-            message_types=adapter.message_types,
+            **elements_kw(KiraMessageEvent, adapter_supported_elements(adapter)),
             message=KiraIMMessage(
                 timestamp=cur_time,
                 sender=user,
@@ -1794,7 +1794,7 @@ class DebouncePlugin(BasePlugin):
         )
 
         try:
-            await self.ctx.message_processor.handle_im_message(event)
+            await self.ctx.event_bus.publish(event)
             logger.info(f"[DM Sustain] 主动触发事件已发布: {sid}")
         except Exception as e:
             logger.error(f"[DM Sustain] 触发主动回复失败: {e}")
@@ -1894,7 +1894,7 @@ class DebouncePlugin(BasePlugin):
 
         event = KiraMessageEvent(
             adapter=adapter.info,
-            message_types=adapter.message_types,
+            **elements_kw(KiraMessageEvent, adapter_supported_elements(adapter)),
             message=KiraIMMessage(
                 timestamp=cur_time,
                 sender=user,
@@ -1915,7 +1915,7 @@ class DebouncePlugin(BasePlugin):
         )
 
         try:
-            await self.ctx.message_processor.handle_im_message(event)
+            await self.ctx.event_bus.publish(event)
             logger.info(f"[Scheduler] 定时任务事件已发布: {sid}")
         except Exception as e:
             logger.error(f"[Scheduler] 处理定时任务失败: {e}")
@@ -2447,7 +2447,7 @@ class DebouncePlugin(BasePlugin):
                     self.batch_started.pop(sid, None)
                     self.batch_count.pop(sid, None)
                     try:
-                        await self.ctx.message_processor.flush_session_messages(sid)
+                        await self.ctx.flush_session_messages(sid)
                     except Exception:
                         logger.exception(f"[Debounce] Error flushing session {sid}")
                     return
@@ -2515,7 +2515,7 @@ class DebouncePlugin(BasePlugin):
                 if self._merge_debug:
                     logger.info(f"[Debounce] 顺延结束 session={sid}（{self.merge_window_seconds}s 无新消息），flush {buffer_len} 条")
                 try:
-                    await self.ctx.message_processor.flush_session_messages(sid)
+                    await self.ctx.flush_session_messages(sid)
                 except Exception:
                     logger.exception(f"[Debounce] Error flushing session {sid}")
                 # 批次已随 flush 送出，清理批次状态（下一批从 0 开始）

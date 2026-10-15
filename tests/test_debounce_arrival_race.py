@@ -144,6 +144,10 @@ class Ctx:
         self.message_processor = Processor(self)
         self.buffers = {}
 
+    async def flush_session_messages(self, sid, **kw):
+        # 镜像真 PluginContext：ctx 级方法就是委托给 message_processor
+        return await self.message_processor.flush_session_messages(sid, **kw)
+
     def get_buffer(self, sid):
         return self.buffers.setdefault(sid, Buf())
 

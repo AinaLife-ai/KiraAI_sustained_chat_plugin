@@ -29,6 +29,37 @@ import time
 from dataclasses import dataclass
 from typing import Optional
 
+
+# ── 双世代兼容（KiraAI 3.0 GA 弃用面，DEP-2/3）─────────────────────
+# 事件类首字段：2.x = message_types；3.0 = supported_elements（旧名仍收但已弃用）。
+def elements_kw(cls, value):
+    """按当前框架事件类的字段名构造关键字参数（dataclasses 探测，不绑版本号）。"""
+    try:
+        from dataclasses import fields as _dc_fields
+        names = {f.name for f in _dc_fields(cls)}
+    except Exception:
+        names = set()
+    key = "supported_elements" if "supported_elements" in names else "message_types"
+    return {key: value}
+
+
+def adapter_supported_elements(adapter, fallback=None):
+    """双世代取适配器支持的元素类型：3.0 走 IMCapability 元数据；2.x 读 message_types。"""
+    get_cap = getattr(adapter, "get_capability", None)
+    if callable(get_cap):
+        try:
+            from core.adapter.capabilities import IMCapability
+            meta = get_cap(IMCapability).get_message_metadata()
+            els = getattr(meta, "supported_elements", None)
+            if els is not None:
+                return list(els)
+        except Exception:
+            pass
+    els = getattr(adapter, "message_types", None)
+    if els is not None:
+        return list(els)
+    return list(fallback or [])
+
 from core.plugin import logger
 from core.chat.message_utils import KiraMessageBatchEvent
 from core.chat.message_elements import Image, Sticker, Record
@@ -54,7 +85,11 @@ class BufferedMsgShim:
 
     def __init__(self, message, batch_event):
         self.message = message
-        self.message_types = getattr(batch_event, "message_types", None)
+        # 双世代：3.0 字段名 supported_elements（2.x=message_types，GA 里旧名是弃用别名属性）
+        _mt = getattr(batch_event, "supported_elements", None)
+        if _mt is None:
+            _mt = getattr(batch_event, "message_types", None)
+        self.message_types = _mt
         self.adapter = getattr(batch_event, "adapter", None)
         self.session = getattr(batch_event, "session", None)
         try:
@@ -513,8 +548,11 @@ class BatchMergeScheduler:
         for pb in batches:
             msgs.extend(pb.batch.messages)
         last = batches[-1].batch
+        _last_els = getattr(last, "supported_elements", None)
+        if _last_els is None:
+            _last_els = getattr(last, "message_types", None)
         merged = KiraMessageBatchEvent(
-            message_types=last.message_types,
+            **elements_kw(KiraMessageBatchEvent, _last_els),
             timestamp=int(time.time()),
             adapter=last.adapter,
             session=last.session,
