@@ -501,6 +501,12 @@
         "default": false,
         "hint": "总开关。开启后按下方各通路模式参与判断；关闭=完全不参与（旧行为）。"
       },
+      "jev_persona_inject": {
+        "type": "switch",
+        "name": "判定注入当前人格",
+        "default": true,
+        "hint": "开启后每次 JEV 判定把当前人格（名字+内容）放进判定上下文，「在叫 bot 吗」这类判断更准（对齐官方 jev 插件的做法）。关闭=旧行为。"
+      },
       "jev_backend": {
         "type": "string",
         "name": "判定后端",

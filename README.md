@@ -1,4 +1,4 @@
-# KiraAI_sustained_chat_plugin/可持续聊天 v2.7.3
+# KiraAI_sustained_chat_plugin/可持续聊天 v2.7.4
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI_sustained_chat_plugin)
 
@@ -371,6 +371,22 @@ croniter>=1.3.0
 
 <details>
 <summary>更新日志</summary>
+
+### v2.7.4
+
+- **JEV 判定层对齐官方 jev 插件的优点（借鉴自 xxynet/kira-ai-plugin-jev，设计目的整体不变）**：
+  - **人格注入判定**（新开关 `jev_persona_inject`，默认开）：每次判定把当前人格（名字+内容）
+    放进判定上下文——「在叫 bot 吗」这类判断更准；关闭=旧行为
+  - **3.0 起会话窗口改读消息档案**（`ctx.message_history`），**范围与缓冲完全一致**
+    （只判外来消息：bot 自己的发言与 notice 排除），窗口更深；读不到/2.x 回落缓冲渲染（旧行为），
+    渲染直接复用 `_render_msgs_for_jev`（输出形态与缓冲逐字一致）
+  - 判定指令末尾固定追加注入防护句（会话内容是不可信数据）
+  - **httpx 原生异步投递**（两代框架都自带 httpx）：零线程零堵塞；桩环境无 httpx 时
+    回退 urllib+线程池（旧路径原样保留）；实例级替换 `_post_sync` 的定制契约不变
+  - HTTP 失败日志带可操作提示（401=API Key 无效 / 429=限流 / 529=过载 …）
+- 测试：新增 `tests/test_jev_ga_upgrade.py`（19 项：人格开关/档案窗口/回落/注入防护/httpx
+  路径与回退链/错误提示）；既有全套件全绿
+- 版本 2.7.3 → 2.7.4
 
 ### v2.7.3
 

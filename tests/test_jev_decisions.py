@@ -232,6 +232,10 @@ async def p4_breaker(jev):
 async def p5_fallback_chain(jev):
     log = SimpleNamespace(info=lambda *a, **k: None, warning=lambda *a, **k: None,
                           debug=lambda *a, **k: None)
+    # 本测试在 urlopen 层模拟链路故障/恢复 ⇒ 明确钉在 urllib 投递路径
+    #（httpx 原生路径的回退链由 test_jev_ga_upgrade.py 覆盖）
+    _orig_httpx = jev.httpx
+    jev.httpx = None
     cli = jev.JevClient([("https://bad1", "k1", "m1"), ("https://good", "k2", "m2")], 0.5, 0.0, log)
     # 在 urlopen 层模拟链路故障/恢复（保留真实 _post_sync 的逐档回退逻辑）
     calls = []
@@ -263,6 +267,7 @@ async def p5_fallback_chain(jev):
         r = await cli.decide_trigger("x", "y")
     finally:
         jev.urllib.request.urlopen = orig
+        jev.httpx = _orig_httpx   # 恢复传输探测
     ok1 = len(calls) == 2 and "bad1" in calls[0][0] and "good" in calls[1][0]
     ok2 = calls[0][1] == "m1" and calls[1][1] == "m2"
     return {"P5 第 1 档失败换第 2 档": ok1 and ok2,

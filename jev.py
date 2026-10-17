@@ -29,6 +29,28 @@ import time
 import urllib.request
 from typing import Optional
 
+# httpx：两代框架都自带（requirements.txt 有 httpx>=0.28.1）；纯桩环境没有时回退 urllib+线程池
+try:
+    import httpx
+except ImportError:  # pragma: no cover
+    httpx = None
+
+#: HTTP 状态码 → 可操作提示（对齐官方 jev 插件的日志可读性）
+_HTTP_HINTS = {
+    400: "请求格式错误（检查模型名/协议）",
+    401: "API Key 无效或过期",
+    403: "无权访问该模型（检查账号权限）",
+    404: "接口地址错误（检查 base_url）",
+    408: "上游超时",
+    409: "并发冲突",
+    429: "触发速率限制（降频或换档）",
+    500: "上游内部错误",
+    502: "网关错误",
+    503: "服务不可用",
+    504: "网关超时",
+    529: "服务过载",
+}
+
 DEFAULT_BASE_URL = "https://api.typesafe.ai"
 DEFAULT_MODEL = "jev-latest"
 
@@ -190,6 +212,7 @@ class JevClient:
         self.tokens = 0          # 累计输入 token（状态观测）
         self.calls = 0           # 成功调用次数
         self.abstains = 0        # 低置信弃权次数
+        self._http = None        # httpx.AsyncClient 惰性实例（无 httpx 时保持 None）
 
     @property
     def model(self) -> str:
@@ -227,6 +250,41 @@ class JevClient:
             self.opened_at = time.time()
             if self.fails == 3:
                 self.logger.warning("[JEV] 连续失败 3 次，冷却 300 秒（期间自动回退机械逻辑）")
+
+    # ---------- 投递（httpx 原生异步优先；无 httpx 回退线程池同步） ----------
+    async def _post_async(self, payload: dict, timeout: float) -> dict:
+        """与 _post_sync 同语义的有序回退链；httpx 在则零线程零堵塞。
+
+        定制契约：实例级替换 `_post_sync` 的（测试/定制注入）优先尊重，
+        仍走线程池调用它——显式替换永不被 httpx 路径吞掉。
+        """
+        override = self.__dict__.get("_post_sync")
+        if override is not None:
+            return await asyncio.to_thread(override, payload, timeout)
+        if httpx is None:
+            return await asyncio.to_thread(self._post_sync, payload, timeout)
+        if self._http is None:
+            self._http = httpx.AsyncClient(timeout=timeout)
+        last_exc = None
+        for idx, (base, key, model_name) in enumerate(self.links, 1):
+            body = dict(payload)
+            if model_name:
+                body["model"] = model_name
+            try:
+                resp = await self._http.post(
+                    endpoint_of(base),
+                    json=body,
+                    headers={"Authorization": "Bearer " + (key or "")},
+                )
+                if resp.status_code != 200:
+                    hint = _HTTP_HINTS.get(resp.status_code, "上游错误")
+                    raise RuntimeError(f"HTTP {resp.status_code}（{hint}）")
+                return resp.json()
+            except Exception as exc:      # 逐档兜住，最后一档才抛
+                last_exc = exc
+                if len(self.links) > 1:
+                    self.logger.info("[JEV] 第 %d 档失败（%s）⇒ 换下一档", idx, type(exc).__name__)
+        raise last_exc if last_exc else RuntimeError("jev_no_endpoint")
 
     # ---------- 同步实现 ----------
     def _post_sync(self, payload: dict, timeout: float) -> dict:
@@ -272,11 +330,11 @@ class JevClient:
         limit = float(timeout or self.timeout)
         try:
             data = await asyncio.wait_for(
-                asyncio.to_thread(self._post_sync, payload, limit), timeout=limit + 0.5
+                self._post_async(payload, limit), timeout=limit + 0.5
             )
         except Exception as exc:  # 契约：任何失败都不得外泄
             self._bad(str(exc))
-            self.logger.info("[JEV] 判断未成功（%s），本轮走机械回退", type(exc).__name__)
+            self.logger.info("[JEV] 判断未成功（%s: %s），本轮走机械回退", type(exc).__name__, str(exc)[:150])
             return None
         if not isinstance(data, dict) or not isinstance(data.get("answers"), dict):
             self._bad("bad_response")
